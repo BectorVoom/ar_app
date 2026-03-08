@@ -7,6 +7,7 @@ import com.example.arspatialpinning.domain.model.ImageFormat
 import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.domain.model.PreparedRenderAsset
 import com.example.arspatialpinning.domain.model.PreviewRenderState
+import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
 import com.example.arspatialpinning.domain.model.RecordingState
 import com.example.arspatialpinning.domain.model.RenderAssetState
 import com.example.arspatialpinning.domain.model.SelectedImage
@@ -104,14 +105,31 @@ class ArUiStateTest {
     }
 
     @Test
-    fun `record button is enabled only while AR is ready and recording state is idle`() {
-        val ready = ArUiState(isArReady = true)
+    fun `record button is enabled only while recording state is idle`() {
+        val ready = ArUiState()
         assertTrue(ready.canRecord)
 
-        assertFalse(ready.copy(isArReady = false).canRecord)
         assertFalse(ready.copy(recordingState = RecordingState.Preparing).canRecord)
         assertFalse(ready.copy(recordingState = RecordingState.Active(startedAtMillis = 1L)).canRecord)
         assertFalse(ready.copy(recordingState = RecordingState.Finalizing).canRecord)
+    }
+
+    @Test
+    fun `download recording is enabled only when idle and validated artifact exists`() {
+        val artifact = RecordedVideoArtifact(
+            sourceUri = Uri.parse("content://recordings/latest.mp4"),
+            displayName = "latest.mp4"
+        )
+        val enabled = ArUiState(
+            recordingState = RecordingState.Idle,
+            lastCompletedRecording = artifact
+        )
+        assertTrue(enabled.canDownloadRecording)
+
+        assertFalse(enabled.copy(lastCompletedRecording = null).canDownloadRecording)
+        assertFalse(enabled.copy(recordingState = RecordingState.Preparing).canDownloadRecording)
+        assertFalse(enabled.copy(recordingState = RecordingState.Active(1L)).canDownloadRecording)
+        assertFalse(enabled.copy(recordingState = RecordingState.Finalizing).canDownloadRecording)
     }
 
     private fun createSelectedImage(selectionRevision: Long): SelectedImage {

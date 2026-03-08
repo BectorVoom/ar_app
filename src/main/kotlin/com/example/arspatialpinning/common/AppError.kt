@@ -49,6 +49,11 @@ sealed interface AppError {
         override val blocking: Boolean = false
     ) : AppError
 
+    data class MediaProjectionConsentIntentFailed(
+        override val message: String = "Unable to request screen capture consent.",
+        override val blocking: Boolean = false
+    ) : AppError
+
     data class RecorderStartFailed(
         override val message: String = "Unable to start recording.",
         override val blocking: Boolean = false
@@ -64,8 +69,33 @@ sealed interface AppError {
         override val blocking: Boolean = false
     ) : AppError
 
+    data class RayneoAudioPolicySetupFailed(
+        override val message: String = "E-REC-006: RayNeo X3 audio policy setup failed.",
+        override val blocking: Boolean = false
+    ) : AppError
+
+    data class RecordedFileInvalid(
+        override val message: String = "Recorded file failed validation.",
+        override val blocking: Boolean = false
+    ) : AppError
+
     data class OutputCreationFailed(
         override val message: String = "Failed to create recording output.",
+        override val blocking: Boolean = false
+    ) : AppError
+
+    data class OutputFinalizeFailed(
+        override val message: String = "Failed to finalize recording output.",
+        override val blocking: Boolean = false
+    ) : AppError
+
+    data class OutputCleanupFailed(
+        override val message: String = "Failed to clean up recording output.",
+        override val blocking: Boolean = false
+    ) : AppError
+
+    data class DownloadExportFailed(
+        override val message: String = "E-STORAGE-003: Failed to export recording.",
         override val blocking: Boolean = false
     ) : AppError
 
@@ -86,6 +116,16 @@ sealed interface AppError {
 
     data class PreviewIdentityMismatch(
         override val message: String = "Preview state identity does not match the prepared asset.",
+        override val blocking: Boolean = false
+    ) : AppError
+
+    data class ArPlacementFailed(
+        override val message: String = "Failed to place image in AR scene.",
+        override val blocking: Boolean = false
+    ) : AppError
+
+    data class ArRepositionFailed(
+        override val message: String = "Failed to reposition image.",
         override val blocking: Boolean = false
     ) : AppError
 

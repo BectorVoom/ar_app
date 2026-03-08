@@ -7,6 +7,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.example.arspatialpinning.platform.media.SharedRecordingUiState
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -26,13 +27,19 @@ class StartScreenInstrumentedTest {
         composeRule.setContent {
             MaterialTheme {
                 StartScreen(
-                    onStartAr = { clicked.set(true) }
+                    recordingUiState = SharedRecordingUiState(isAppResumed = true),
+                    onStartAr = { clicked.set(true) },
+                    onRecordClick = {},
+                    onStopRecordClick = {},
+                    onDownloadRecordingClick = {}
                 )
             }
         }
 
         composeRule.onNodeWithText("AR Spatial Pinning").assertIsDisplayed()
         composeRule.onNodeWithText("Start AR Session").assertIsDisplayed()
+        composeRule.onNodeWithText("Record").assertIsDisplayed()
+        composeRule.onNodeWithText("Download Recording").assertIsDisplayed()
         composeRule.onNodeWithText("Start AR Session").performClick()
 
         composeRule.runOnIdle {

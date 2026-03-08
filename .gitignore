@@ -40,6 +40,6 @@ bin/
 
 ### VS Code ###
 .vscode/
-
+.gradle-user/
 ### Mac OS ###
 .DS_Store

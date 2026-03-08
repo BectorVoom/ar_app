@@ -10,6 +10,7 @@ import androidx.compose.ui.test.performClick
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.example.arspatialpinning.app.AppContainer
+import com.example.arspatialpinning.platform.media.SharedRecordingUiState
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -27,7 +28,11 @@ class MainNavigationInstrumentedTest {
         composeRule.setContent {
             AppNavHost(
                 appContainer = AppContainer(context),
-                arRouteContent = {
+                sharedRecordingUiState = SharedRecordingUiState(isAppResumed = true),
+                onRecordClick = {},
+                onStopRecordClick = {},
+                onDownloadRecordingClick = {},
+                arRouteContent = { _, _ ->
                     Text("AR Route Stub")
                 }
             )

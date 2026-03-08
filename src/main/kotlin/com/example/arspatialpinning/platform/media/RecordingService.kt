@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.content.ContextCompat
+import java.util.concurrent.atomic.AtomicBoolean
 
 class RecordingService : Service() {
     private val notificationFactory by lazy { RecordingNotificationFactory(this) }
@@ -23,28 +24,37 @@ class RecordingService : Service() {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 )
-            }
-
-            ACTION_STOP -> {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                setForegroundReady(true)
             }
         }
         return START_NOT_STICKY
     }
 
+    override fun onDestroy() {
+        setForegroundReady(false)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        super.onDestroy()
+    }
+
     companion object {
         private const val ACTION_START = "com.example.arspatialpinning.action.START_RECORDING_SERVICE"
-        private const val ACTION_STOP = "com.example.arspatialpinning.action.STOP_RECORDING_SERVICE"
+        private val foregroundReadyFlag = AtomicBoolean(false)
 
         fun start(context: Context) {
+            setForegroundReady(false)
             val intent = Intent(context, RecordingService::class.java).setAction(ACTION_START)
             ContextCompat.startForegroundService(context, intent)
         }
 
         fun stop(context: Context) {
-            val intent = Intent(context, RecordingService::class.java).setAction(ACTION_STOP)
-            context.startService(intent)
+            setForegroundReady(false)
+            context.stopService(Intent(context, RecordingService::class.java))
+        }
+
+        fun isForegroundReady(): Boolean = foregroundReadyFlag.get()
+
+        private fun setForegroundReady(value: Boolean) {
+            foregroundReadyFlag.set(value)
         }
     }
 }

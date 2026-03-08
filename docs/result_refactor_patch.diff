@@ -1,0 +1,3942 @@
+
+diff --git a/src/main/kotlin/com/example/arspatialpinning/common/AppError.kt b/src/main/kotlin/com/example/arspatialpinning/common/AppError.kt
+index 0a34f43..7ccd485 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/common/AppError.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/common/AppError.kt
+@@ -49,6 +49,11 @@ sealed interface AppError {
+         override val blocking: Boolean = false
+     ) : AppError
+ 
++    data class MediaProjectionConsentIntentFailed(
++        override val message: String = "Unable to request screen capture consent.",
++        override val blocking: Boolean = false
++    ) : AppError
++
+     data class RecorderStartFailed(
+         override val message: String = "Unable to start recording.",
+         override val blocking: Boolean = false
+@@ -64,11 +69,36 @@ sealed interface AppError {
+         override val blocking: Boolean = false
+     ) : AppError
+ 
++    data class RayneoAudioPolicySetupFailed(
++        override val message: String = "E-REC-006: RayNeo X3 audio policy setup failed.",
++        override val blocking: Boolean = false
++    ) : AppError
++
++    data class RecordedFileInvalid(
++        override val message: String = "Recorded file failed validation.",
++        override val blocking: Boolean = false
++    ) : AppError
++
+     data class OutputCreationFailed(
+         override val message: String = "Failed to create recording output.",
+         override val blocking: Boolean = false
+     ) : AppError
+ 
++    data class OutputFinalizeFailed(
++        override val message: String = "Failed to finalize recording output.",
++        override val blocking: Boolean = false
++    ) : AppError
++
++    data class OutputCleanupFailed(
++        override val message: String = "Failed to clean up recording output.",
++        override val blocking: Boolean = false
++    ) : AppError
++
++    data class DownloadExportFailed(
++        override val message: String = "E-STORAGE-003: Failed to export recording.",
++        override val blocking: Boolean = false
++    ) : AppError
++
+     data class StaleOrMissingPreparedAssetHandle(
+         override val message: String = "Prepared render asset is stale or missing.",
+         override val blocking: Boolean = false
+@@ -89,6 +119,16 @@ sealed interface AppError {
+         override val blocking: Boolean = false
+     ) : AppError
+ 
++    data class ArPlacementFailed(
++        override val message: String = "Failed to place image in AR scene.",
++        override val blocking: Boolean = false
++    ) : AppError
++
++    data class ArRepositionFailed(
++        override val message: String = "Failed to reposition image.",
++        override val blocking: Boolean = false
++    ) : AppError
++
+     data class RecordingFailure(
+         override val message: String,
+         override val blocking: Boolean = false
+diff --git a/src/main/kotlin/com/example/arspatialpinning/common/Result.kt b/src/main/kotlin/com/example/arspatialpinning/common/Result.kt
+index 844de88..7b5f65f 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/common/Result.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/common/Result.kt
+@@ -9,3 +9,16 @@ inline fun <T, R> AppResult<T>.map(transform: (T) -> R): AppResult<R> = when (th
+     is AppResult.Success -> AppResult.Success(transform(value))
+     is AppResult.Failure -> this
+ }
++
++inline fun <T, R> AppResult<T>.flatMap(transform: (T) -> AppResult<R>): AppResult<R> = when (this) {
++    is AppResult.Success -> transform(value)
++    is AppResult.Failure -> this
++}
++
++inline fun <T, R> AppResult<T>.fold(
++    onSuccess: (T) -> R,
++    onFailure: (AppError) -> R
++): R = when (this) {
++    is AppResult.Success -> onSuccess(value)
++    is AppResult.Failure -> onFailure(error)
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/ar/ArSceneControllerImpl.kt b/src/main/kotlin/com/example/arspatialpinning/platform/ar/ArSceneControllerImpl.kt
+index 90d5769..4912316 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/platform/ar/ArSceneControllerImpl.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/ar/ArSceneControllerImpl.kt
+@@ -29,6 +29,7 @@ import io.github.sceneview.math.Scale
+ import io.github.sceneview.math.Size
+ import io.github.sceneview.node.ImageNode
+ import io.github.sceneview.node.Node
++import java.lang.reflect.InvocationTargetException
+ import java.util.UUID
+ import kotlin.math.atan2
+ import kotlin.math.sqrt
+@@ -115,67 +116,89 @@ class ArSceneControllerImpl(
+             return AppResult.Failure(AppError.Unexpected("AR scene is not initialized."))
+         }
+ 
+-        return try {
+-            invalidatePreparedRegistry()
++        invalidatePreparedRegistry()
+ 
+-            val decodeResult = uriReadPermissionGuard.withReadPermission(selectedImage.uri) {
+-                imageUriReader.decodeBitmap(selectedImage)
+-            }
+-            val decodedBitmap = when (decodeResult) {
+-                is AppResult.Success -> decodeResult.value
+-                is AppResult.Failure -> return decodeResult
+-            }
+-            if (decodedBitmap.width <= 0 || decodedBitmap.height <= 0) {
+-                decodedBitmap.safeRecycle()
+-                return AppResult.Failure(AppError.DimensionOnlySuccessAttempted())
+-            }
++        val decodeResult = uriReadPermissionGuard.withReadPermission(selectedImage.uri) {
++            imageUriReader.decodeBitmap(selectedImage)
++        }
++        val decodedBitmap = when (decodeResult) {
++            is AppResult.Success -> decodeResult.value
++            is AppResult.Failure -> return decodeResult
++        }
++        if (decodedBitmap.width <= 0 || decodedBitmap.height <= 0) {
++            decodedBitmap.safeRecycle()
++            return AppResult.Failure(AppError.DimensionOnlySuccessAttempted())
++        }
+ 
+-            val assetHandleId = UUID.randomUUID().toString()
+-            val asset = PreparedRenderAsset(
+-                assetHandleId = assetHandleId,
+-                widthPx = decodedBitmap.width,
+-                heightPx = decodedBitmap.height,
+-                aspectRatio = decodedBitmap.width.toFloat() / decodedBitmap.height.toFloat(),
+-                selectionRevision = selectedImage.selectionRevision
+-            )
+-            val previewNode = buildImageNode(
++        val assetHandleId = UUID.randomUUID().toString()
++        val asset = PreparedRenderAsset(
++            assetHandleId = assetHandleId,
++            widthPx = decodedBitmap.width,
++            heightPx = decodedBitmap.height,
++            aspectRatio = decodedBitmap.width.toFloat() / decodedBitmap.height.toFloat(),
++            selectionRevision = selectedImage.selectionRevision
++        )
++
++        val previewNode = try {
++            buildImageNode(
+                 bitmap = decodedBitmap,
+                 sceneMaterialLoader = sceneMaterialLoader,
+                 aspectRatio = asset.aspectRatio
+             ).apply {
+                 isVisible = false
+             }
+-            sceneNodes += previewNode
++        } catch (error: IllegalArgumentException) {
++            decodedBitmap.safeRecycle()
++            logger.e(TAG, "Failed to build preview node for selected image.", error)
++            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
++        } catch (error: IllegalStateException) {
++            decodedBitmap.safeRecycle()
++            logger.e(TAG, "Failed to build preview node for selected image.", error)
++            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
++        } catch (error: RuntimeException) {
++            decodedBitmap.safeRecycle()
++            logger.e(TAG, "Failed to build preview node for selected image.", error)
++            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
++        }
+ 
+-            val bundle = PreparedRenderBundle(
+-                selectedImage = selectedImage,
+-                preparedAsset = asset,
+-                bitmap = decodedBitmap,
+-                node = previewNode,
+-                role = NodeRole.Preview
+-            )
+-            preparedBundleRegistry[assetHandleId] = bundle
+-            activePreparedAsset = asset
+-            placedAssetHandleId = null
+-            placedState = null
+-
+-            debugStatusTracker.onPreparedAssetRegistered(assetHandleId)
+-            debugStatusTracker.onPreviewNodePrepared(
+-                assetHandleId = assetHandleId,
+-                attached = isPreviewAttached(previewNode)
+-            )
++        try {
++            sceneNodes += previewNode
++        } catch (error: UnsupportedOperationException) {
++            previewNode.safeDestroy(logger)
++            decodedBitmap.safeRecycle()
++            logger.e(TAG, "Failed to attach preview node to scene.", error)
++            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
++        } catch (error: RuntimeException) {
++            previewNode.safeDestroy(logger)
++            decodedBitmap.safeRecycle()
++            logger.e(TAG, "Failed to attach preview node to scene.", error)
++            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
++        }
++
++        val bundle = PreparedRenderBundle(
++            selectedImage = selectedImage,
++            preparedAsset = asset,
++            bitmap = decodedBitmap,
++            node = previewNode,
++            role = NodeRole.Preview
++        )
++        preparedBundleRegistry[assetHandleId] = bundle
++        activePreparedAsset = asset
++        placedAssetHandleId = null
++        placedState = null
+ 
+-            val registered = preparedBundleRegistry[assetHandleId] != null
+-            if (!registered) {
+-                return AppResult.Failure(AppError.MetadataOnlySuccessAttempted())
+-            }
++        debugStatusTracker.onPreparedAssetRegistered(assetHandleId)
++        debugStatusTracker.onPreviewNodePrepared(
++            assetHandleId = assetHandleId,
++            attached = isPreviewAttached(previewNode)
++        )
+ 
+-            AppResult.Success(asset)
+-        } catch (t: Throwable) {
+-            logger.e(TAG, "Failed to prepare image render asset.", t)
+-            invalidatePreparedRegistry()
+-            AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
++        val registered = preparedBundleRegistry[assetHandleId] != null
++        if (!registered) {
++            return AppResult.Failure(AppError.MetadataOnlySuccessAttempted())
+         }
++
++        return AppResult.Success(asset)
+     }
+ 
+     override fun processFrame(
+@@ -296,18 +319,45 @@ class ArSceneControllerImpl(
+             return AppResult.Failure(AppError.PreviewRenderCreationFailed("Prepared preview node is not attached."))
+         }
+ 
+-        return try {
+-            val placement = computePlacement(stable)
+-            val anchor = session.createAnchor(
++        val placement = computePlacement(stable)
++        val anchor = try {
++            session.createAnchor(
+                 Pose.makeTranslation(
+                     placement.translationX,
+                     placement.translationY,
+                     placement.translationZ
+                 )
+             )
+-            val anchorNode = AnchorNode(sceneEngine, anchor)
+-            val node = bundle.node
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        }
++
++        val anchorNode = try {
++            AnchorNode(sceneEngine, anchor)
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            safeDetachAnchor(anchor, logger)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            safeDetachAnchor(anchor, logger)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            safeDetachAnchor(anchor, logger)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        }
+ 
++        val node = bundle.node
++
++        try {
+             deletePlacedImage()
+ 
+             sceneNodes.remove(node)
+@@ -320,28 +370,41 @@ class ArSceneControllerImpl(
+ 
+             anchorNode.addChildNode(node)
+             sceneNodes += anchorNode
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            anchorNode.safeDestroy(logger)
++            safeDetachAnchor(anchor, logger)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        } catch (error: UnsupportedOperationException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            anchorNode.safeDestroy(logger)
++            safeDetachAnchor(anchor, logger)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to place prepared image.", error)
++            anchorNode.safeDestroy(logger)
++            safeDetachAnchor(anchor, logger)
++            return AppResult.Failure(AppError.ArPlacementFailed())
++        }
++
++        bundle.role = NodeRole.Placed
++        placedAnchorNode = anchorNode
++        placedImageNode = node
++        placedAssetHandleId = preparedAsset.assetHandleId
++        val placed = PlacedImageState(
++            anchorId = anchor.hashCode().toString(),
++            widthMeters = DEFAULT_HEIGHT_METERS * preparedAsset.aspectRatio,
++            heightMeters = DEFAULT_HEIGHT_METERS,
++            transform = PlacementTransform(scale = 1f, rotationYDegrees = normalizeDegrees(placement.rotationYDegrees))
++        )
++        placedState = placed
+ 
+-            bundle.role = NodeRole.Placed
+-            placedAnchorNode = anchorNode
+-            placedImageNode = node
+-            placedAssetHandleId = preparedAsset.assetHandleId
+-            placedState = PlacedImageState(
+-                anchorId = anchor.hashCode().toString(),
+-                widthMeters = DEFAULT_HEIGHT_METERS * preparedAsset.aspectRatio,
+-                heightMeters = DEFAULT_HEIGHT_METERS,
+-                transform = PlacementTransform(scale = 1f, rotationYDegrees = normalizeDegrees(placement.rotationYDegrees))
+-            )
+-
+-            debugStatusTracker.onPlaced(
+-                assetHandleId = preparedAsset.assetHandleId,
+-                placedAttached = isPlacedAttached()
+-            )
++        debugStatusTracker.onPlaced(
++            assetHandleId = preparedAsset.assetHandleId,
++            placedAttached = isPlacedAttached()
++        )
+ 
+-            AppResult.Success(requireNotNull(placedState))
+-        } catch (t: Throwable) {
+-            logger.e(TAG, "Failed to place prepared image.", t)
+-            AppResult.Failure(AppError.Unexpected("Failed to place image in AR scene."))
+-        }
++        return AppResult.Success(placed)
+     }
+ 
+     override fun enterRepositionMode() {
+@@ -357,17 +420,42 @@ class ArSceneControllerImpl(
+         val currentState = placedState ?: return AppResult.Failure(AppError.Unexpected("No placed state."))
+         val handleId = placedAssetHandleId ?: return AppResult.Failure(AppError.StaleOrMissingPreparedAssetHandle())
+ 
+-        return try {
+-            val placement = computePlacement(stable)
+-            val newAnchor = session.createAnchor(
++        val placement = computePlacement(stable)
++        val newAnchor = try {
++            session.createAnchor(
+                 Pose.makeTranslation(
+                     placement.translationX,
+                     placement.translationY,
+                     placement.translationZ
+                 )
+             )
+-            val newAnchorNode = AnchorNode(sceneEngine, newAnchor)
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        }
++        val newAnchorNode = try {
++            AnchorNode(sceneEngine, newAnchor)
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            safeDetachAnchor(newAnchor, logger)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            safeDetachAnchor(newAnchor, logger)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            safeDetachAnchor(newAnchor, logger)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        }
+ 
++        try {
+             oldAnchorNode.removeChildNode(node)
+             sceneNodes.remove(oldAnchorNode)
+             oldAnchorNode.detachAnchor()
+@@ -380,16 +468,29 @@ class ArSceneControllerImpl(
+ 
+             newAnchorNode.addChildNode(node)
+             sceneNodes += newAnchorNode
+-
+-            placedAnchorNode = newAnchorNode
+-            placedState = currentState.copy(anchorId = newAnchor.hashCode().toString())
+-
+-            debugStatusTracker.onPlaced(assetHandleId = handleId, placedAttached = isPlacedAttached())
+-            AppResult.Success(requireNotNull(placedState))
+-        } catch (t: Throwable) {
+-            logger.e(TAG, "Failed to reposition image.", t)
+-            AppResult.Failure(AppError.Unexpected("Failed to reposition image."))
+-        }
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            newAnchorNode.safeDestroy(logger)
++            safeDetachAnchor(newAnchor, logger)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        } catch (error: UnsupportedOperationException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            newAnchorNode.safeDestroy(logger)
++            safeDetachAnchor(newAnchor, logger)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to reposition image.", error)
++            newAnchorNode.safeDestroy(logger)
++            safeDetachAnchor(newAnchor, logger)
++            return AppResult.Failure(AppError.ArRepositionFailed())
++        }
++
++        placedAnchorNode = newAnchorNode
++        val placed = currentState.copy(anchorId = newAnchor.hashCode().toString())
++        placedState = placed
++
++        debugStatusTracker.onPlaced(assetHandleId = handleId, placedAttached = isPlacedAttached())
++        return AppResult.Success(placed)
+     }
+ 
+     override fun cancelReposition() {
+@@ -538,8 +639,16 @@ class ArSceneControllerImpl(
+                 visible = node.isVisible
+             )
+             PreviewRenderState.HiddenNoStableHit
+-        } catch (t: Throwable) {
+-            logger.e(TAG, "Failed to update preview pose.", t)
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to update preview pose.", error)
++            bundle.node.isVisible = false
++            debugStatusTracker.onPreviewHidden(
++                assetHandleId = bundle.preparedAsset.assetHandleId,
++                attached = isPreviewAttached(bundle.node)
++            )
++            PreviewRenderState.Error("Preview pose update failed.")
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to update preview pose.", error)
+             bundle.node.isVisible = false
+             debugStatusTracker.onPreviewHidden(
+                 assetHandleId = bundle.preparedAsset.assetHandleId,
+@@ -624,18 +733,9 @@ class ArSceneControllerImpl(
+         deletePlacedImage()
+         val sceneNodes = childNodes
+         preparedBundleRegistry.values.forEach { bundle ->
+-            try {
+-                bundle.node.parent?.removeChildNode(bundle.node)
+-            } catch (_: Throwable) {
+-            }
+-            try {
+-                sceneNodes?.remove(bundle.node)
+-            } catch (_: Throwable) {
+-            }
+-            try {
+-                bundle.node.destroy()
+-            } catch (_: Throwable) {
+-            }
++            tryRemoveFromParent(bundle.node)
++            tryRemoveFromScene(sceneNodes, bundle.node)
++            bundle.node.safeDestroy(logger)
+             bundle.bitmap.safeRecycle()
+         }
+         preparedBundleRegistry.clear()
+@@ -651,12 +751,17 @@ class ArSceneControllerImpl(
+         val node = placedImageNode
+ 
+         if (node != null && anchorNode != null && node.parent == anchorNode) {
+-            anchorNode.removeChildNode(node)
++            try {
++                anchorNode.removeChildNode(node)
++            } catch (error: IllegalStateException) {
++                logger.d(TAG, "Failed to remove placed image node from anchor: ${error.message}")
++            } catch (error: RuntimeException) {
++                logger.d(TAG, "Failed to remove placed image node from anchor: ${error.message}")
++            }
+         }
+         if (anchorNode != null) {
+-            sceneNodes?.remove(anchorNode)
+-            anchorNode.detachAnchor()
+-            anchorNode.destroy()
++            tryRemoveFromScene(sceneNodes, anchorNode)
++            anchorNode.safeDestroy(logger)
+         }
+ 
+         placedAnchorNode = null
+@@ -735,7 +840,21 @@ class ArSceneControllerImpl(
+             val field = node.javaClass.getDeclaredField("alpha")
+             field.isAccessible = true
+             field.setFloat(node, clamped)
+-        } catch (_: Throwable) {
++        } catch (error: NoSuchFieldException) {
++            logger.d(TAG, "Alpha field is unavailable: ${error.message}")
++        } catch (error: SecurityException) {
++            logger.d(TAG, "Alpha reflection blocked: ${error.message}")
++        } catch (error: IllegalAccessException) {
++            logger.d(TAG, "Alpha reflection inaccessible: ${error.message}")
++        } catch (error: IllegalArgumentException) {
++            logger.d(TAG, "Alpha reflection call invalid: ${error.message}")
++        } catch (error: InvocationTargetException) {
++            logger.d(TAG, "Alpha reflection target failed: ${error.targetException?.message ?: error.message}")
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Alpha update failed: ${error.message}")
++        } catch (error: RuntimeException) {
++            // SceneView node internals may throw runtime exceptions during material updates.
++            logger.d(TAG, "Alpha update failed: ${error.message}")
+         }
+     }
+ 
+@@ -749,13 +868,24 @@ class ArSceneControllerImpl(
+             "setCulling" to booleanFalse
+         )
+         methodCandidates.forEach { (name, value) ->
+-            runCatching {
++            try {
+                 val method = node.javaClass.methods.firstOrNull {
+                     it.name == name &&
+                         it.parameterTypes.size == 1 &&
+                         it.parameterTypes[0] == Boolean::class.javaPrimitiveType
+                 }
+                 method?.invoke(node, value)
++            } catch (error: IllegalAccessException) {
++                logger.d(TAG, "Image material config failed for $name: ${error.message}")
++            } catch (error: IllegalArgumentException) {
++                logger.d(TAG, "Image material config failed for $name: ${error.message}")
++            } catch (error: InvocationTargetException) {
++                logger.d(TAG, "Image material config failed for $name: ${error.targetException?.message ?: error.message}")
++            } catch (error: IllegalStateException) {
++                logger.d(TAG, "Image material config failed for $name: ${error.message}")
++            } catch (error: RuntimeException) {
++                // SceneView APIs may throw runtime exceptions depending on renderer state.
++                logger.d(TAG, "Image material config failed for $name: ${error.message}")
+             }
+         }
+     }
+@@ -765,7 +895,70 @@ class ArSceneControllerImpl(
+             if (!isRecycled) {
+                 recycle()
+             }
+-        } catch (_: Throwable) {
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Bitmap recycle failed: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Bitmap recycle failed: ${error.message}")
++        }
++    }
++
++    private fun tryRemoveFromParent(node: Node) {
++        try {
++            node.parent?.removeChildNode(node)
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Failed to remove node from parent: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Failed to remove node from parent: ${error.message}")
++        }
++    }
++
++    private fun tryRemoveFromScene(sceneNodes: MutableList<Node>?, node: Node) {
++        if (sceneNodes == null) {
++            return
++        }
++        try {
++            sceneNodes.remove(node)
++        } catch (error: UnsupportedOperationException) {
++            logger.d(TAG, "Failed to remove node from scene: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Failed to remove node from scene: ${error.message}")
++        }
++    }
++
++    private fun AnchorNode.safeDestroy(logger: Logger) {
++        try {
++            detachAnchor()
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Failed to detach anchor node: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Failed to detach anchor node: ${error.message}")
++        }
++        try {
++            destroy()
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Failed to destroy anchor node: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Failed to destroy anchor node: ${error.message}")
++        }
++    }
++
++    private fun Node.safeDestroy(logger: Logger) {
++        try {
++            destroy()
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Failed to destroy node: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Failed to destroy node: ${error.message}")
++        }
++    }
++
++    private fun safeDetachAnchor(anchor: com.google.ar.core.Anchor, logger: Logger) {
++        try {
++            anchor.detach()
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Failed to detach anchor: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Failed to detach anchor: ${error.message}")
+         }
+     }
+ 
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReader.kt b/src/main/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReader.kt
+index 1e0a5a9..4890759 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReader.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReader.kt
+@@ -22,65 +22,64 @@ class AndroidImageUriReader(
+         validation: ImageValidationResult,
+         selectionRevision: Long
+     ): AppResult<SelectedImage> {
+-        return try {
+-            val (width, height) = decodeBounds(uri, validation.format.name)
+-            if (width <= 0 || height <= 0) {
+-                return AppResult.Failure(
+-                    AppError.InvalidImage("Selected image could not be decoded.")
+-                )
+-            }
++        return when (val bounds = decodeBounds(uri, validation.format.name)) {
++            is AppResult.Failure -> bounds
++            is AppResult.Success -> {
++                val (width, height) = bounds.value
++                if (width <= 0 || height <= 0) {
++                    return AppResult.Failure(
++                        AppError.InvalidImage("Selected image could not be decoded.")
++                    )
++                }
+ 
+-            AppResult.Success(
+-                SelectedImage(
+-                    uri = uri,
+-                    displayName = validation.displayName,
+-                    mimeType = validation.mimeType,
+-                    widthPx = width,
+-                    heightPx = height,
+-                    format = validation.format,
+-                    selectionRevision = selectionRevision
++                AppResult.Success(
++                    SelectedImage(
++                        uri = uri,
++                        displayName = validation.displayName,
++                        mimeType = validation.mimeType,
++                        widthPx = width,
++                        heightPx = height,
++                        format = validation.format,
++                        selectionRevision = selectionRevision
++                    )
+                 )
+-            )
+-        } catch (error: IOException) {
+-            Log.e(TAG, "Failed to read selected image metadata uri=$uri", error)
+-            AppResult.Failure(AppError.FileOpenFailed())
+-        } catch (error: SecurityException) {
+-            Log.e(TAG, "Missing read permission while reading metadata uri=$uri", error)
+-            AppResult.Failure(AppError.FileOpenFailed())
++            }
+         }
+     }
+ 
+     override fun decodeBitmap(selectedImage: SelectedImage): AppResult<Bitmap> {
+-        return try {
+-            if (selectedImage.widthPx <= 0 || selectedImage.heightPx <= 0) {
+-                return AppResult.Failure(
+-                    AppError.DimensionOnlySuccessAttempted()
+-                )
+-            }
+-
+-            val inSampleSize = computeInSampleSize(
+-                width = selectedImage.widthPx,
+-                height = selectedImage.heightPx
++        if (selectedImage.widthPx <= 0 || selectedImage.heightPx <= 0) {
++            return AppResult.Failure(
++                AppError.DimensionOnlySuccessAttempted()
+             )
+-            val decodeOptions = BitmapFactory.Options().apply {
+-                this.inSampleSize = inSampleSize
+-                this.inPreferredConfig = if (selectedImage.format == ImageFormat.Png) {
+-                    Bitmap.Config.ARGB_8888
+-                } else {
+-                    Bitmap.Config.RGB_565
+-                }
++        }
++
++        val inSampleSize = computeInSampleSize(
++            width = selectedImage.widthPx,
++            height = selectedImage.heightPx
++        )
++        val decodeOptions = BitmapFactory.Options().apply {
++            this.inSampleSize = inSampleSize
++            this.inPreferredConfig = if (selectedImage.format == ImageFormat.Png) {
++                Bitmap.Config.ARGB_8888
++            } else {
++                Bitmap.Config.RGB_565
+             }
++        }
+ 
+-            val decodeStream = uriStreamOpener.openForRead(selectedImage.uri)
+-            if (decodeStream == null) {
+-                Log.e(TAG, "Unable to decode bitmap because stream open returned null. uri=${selectedImage.uri}")
+-                return AppResult.Failure(AppError.FileOpenFailed())
++        val streamResult = uriStreamOpener.openForRead(selectedImage.uri)
++        val decodeStream = when (streamResult) {
++            is AppResult.Success -> streamResult.value
++            is AppResult.Failure -> {
++                Log.e(TAG, "Unable to decode bitmap because stream open failed. uri=${selectedImage.uri}")
++                return streamResult
+             }
++        }
+ 
++        return try {
+             val bitmap = decodeStream.use { input ->
+                 BitmapFactory.decodeStream(input, null, decodeOptions)
+             } ?: return AppResult.Failure(AppError.InvalidImage("Failed to decode the selected image."))
+-
+             AppResult.Success(bitmap)
+         } catch (error: IOException) {
+             Log.e(TAG, "Failed to decode selected image uri=${selectedImage.uri}", error)
+@@ -88,25 +87,47 @@ class AndroidImageUriReader(
+         } catch (error: SecurityException) {
+             Log.e(TAG, "Missing read permission for selected image uri=${selectedImage.uri}", error)
+             AppResult.Failure(AppError.FileOpenFailed())
++        } catch (error: IllegalArgumentException) {
++            Log.e(TAG, "Invalid decode options for selected image uri=${selectedImage.uri}", error)
++            AppResult.Failure(AppError.InvalidImage("Failed to decode the selected image."))
++        } catch (error: IllegalStateException) {
++            Log.e(TAG, "Bitmap decode failed for selected image uri=${selectedImage.uri}", error)
++            AppResult.Failure(AppError.InvalidImage("Failed to decode the selected image."))
+         }
+     }
+ 
+-    private fun decodeBounds(uri: Uri, formatName: String): Pair<Int, Int> {
++    private fun decodeBounds(uri: Uri, formatName: String): AppResult<Pair<Int, Int>> {
+         val boundsOptions = BitmapFactory.Options().apply {
+             inJustDecodeBounds = true
+         }
+ 
+-        val boundsStream = uriStreamOpener.openForRead(uri)
+-        if (boundsStream == null) {
+-            Log.e(TAG, "Unable to decode bounds because stream open returned null. uri=$uri format=$formatName")
+-            throw IOException("Unable to open URI for bounds decode")
++        val streamResult = uriStreamOpener.openForRead(uri)
++        val boundsStream = when (streamResult) {
++            is AppResult.Success -> streamResult.value
++            is AppResult.Failure -> {
++                Log.e(TAG, "Unable to decode bounds because stream open failed. uri=$uri format=$formatName")
++                return streamResult
++            }
+         }
+ 
+-        boundsStream.use { input ->
+-            BitmapFactory.decodeStream(input, null, boundsOptions)
++        return try {
++            boundsStream.use { input ->
++                BitmapFactory.decodeStream(input, null, boundsOptions)
++            }
++            AppResult.Success(boundsOptions.outWidth to boundsOptions.outHeight)
++        } catch (error: IOException) {
++            Log.e(TAG, "Failed to decode bounds for selected image uri=$uri format=$formatName", error)
++            AppResult.Failure(AppError.FileOpenFailed())
++        } catch (error: SecurityException) {
++            Log.e(TAG, "Missing read permission while decoding bounds uri=$uri format=$formatName", error)
++            AppResult.Failure(AppError.FileOpenFailed())
++        } catch (error: IllegalArgumentException) {
++            Log.e(TAG, "Invalid bounds decode request uri=$uri format=$formatName", error)
++            AppResult.Failure(AppError.InvalidImage("Selected image could not be decoded."))
++        } catch (error: IllegalStateException) {
++            Log.e(TAG, "Bounds decode failed uri=$uri format=$formatName", error)
++            AppResult.Failure(AppError.InvalidImage("Selected image could not be decoded."))
+         }
+-
+-        return boundsOptions.outWidth to boundsOptions.outHeight
+     }
+ 
+     private fun computeInSampleSize(width: Int, height: Int): Int {
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/file/ImageValidator.kt b/src/main/kotlin/com/example/arspatialpinning/platform/file/ImageValidator.kt
+index d86fac5..3033f08 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/platform/file/ImageValidator.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/file/ImageValidator.kt
+@@ -7,6 +7,7 @@ import android.util.Log
+ import com.example.arspatialpinning.common.AppError
+ import com.example.arspatialpinning.common.AppResult
+ import com.example.arspatialpinning.domain.model.ImageFormat
++import java.io.IOException
+ 
+ data class ImageValidationResult(
+     val format: ImageFormat,
+@@ -19,20 +20,36 @@ class ImageValidator(
+     private val uriStreamOpener: UriStreamOpener = ContentResolverUriStreamOpener(contentResolver)
+ ) {
+     fun validate(uri: Uri): AppResult<ImageValidationResult> {
+-        val mimeType = runCatching { contentResolver.getType(uri) }.getOrNull()
++        val mimeType = readMimeType(uri)
+         val displayName = readDisplayName(uri)
+         val inspection: HeaderInspection
+ 
+-        try {
+-            val stream = uriStreamOpener.openForRead(uri)
+-            if (stream == null) {
+-                Log.e(TAG, "Unable to inspect selected image because stream open returned null. uri=$uri mime=$mimeType displayName=$displayName")
+-                return AppResult.Failure(AppError.FileOpenFailed())
++        when (val streamResult = uriStreamOpener.openForRead(uri)) {
++            is AppResult.Failure -> {
++                Log.e(
++                    TAG,
++                    "Unable to inspect selected image because stream open failed. uri=$uri mime=$mimeType displayName=$displayName"
++                )
++                return streamResult
++            }
++
++            is AppResult.Success -> {
++                try {
++                    inspection = streamResult.value.use(::inspectHeaderAndTail)
++                } catch (error: IOException) {
++                    Log.e(TAG, "Failed to inspect selected image uri=$uri", error)
++                    return AppResult.Failure(AppError.FileOpenFailed())
++                } catch (error: SecurityException) {
++                    Log.e(TAG, "Missing read permission while inspecting selected image uri=$uri", error)
++                    return AppResult.Failure(AppError.FileOpenFailed())
++                } catch (error: IllegalArgumentException) {
++                    Log.e(TAG, "Invalid image stream while inspecting uri=$uri", error)
++                    return AppResult.Failure(AppError.InvalidImage())
++                } catch (error: IllegalStateException) {
++                    Log.e(TAG, "Image stream inspection failed for uri=$uri", error)
++                    return AppResult.Failure(AppError.InvalidImage())
++                }
+             }
+-            inspection = stream.use(::inspectHeaderAndTail)
+-        } catch (error: Throwable) {
+-            Log.e(TAG, "Failed to inspect selected image uri=$uri", error)
+-            return AppResult.Failure(AppError.FileOpenFailed())
+         }
+ 
+         val format = ImageValidationRules.resolveFormat(
+@@ -56,6 +73,21 @@ class ImageValidator(
+         )
+     }
+ 
++    private fun readMimeType(uri: Uri): String? {
++        return try {
++            contentResolver.getType(uri)
++        } catch (error: SecurityException) {
++            Log.d(TAG, "Unable to resolve MIME type due to missing permission for uri=$uri")
++            null
++        } catch (error: IllegalArgumentException) {
++            Log.d(TAG, "Unable to resolve MIME type due to invalid uri=$uri")
++            null
++        } catch (error: IllegalStateException) {
++            Log.d(TAG, "Unable to resolve MIME type due to provider state for uri=$uri")
++            null
++        }
++    }
++
+     private fun inspectHeaderAndTail(input: java.io.InputStream): HeaderInspection {
+         val header = ByteArray(MAX_HEADER_LENGTH)
+         var headerLength = 0
+@@ -93,7 +125,7 @@ class ImageValidator(
+     }
+ 
+     private fun readDisplayName(uri: Uri): String? {
+-        val fromMetadata = runCatching {
++        val fromMetadata = try {
+             contentResolver.query(
+                 uri,
+                 arrayOf(OpenableColumns.DISPLAY_NAME),
+@@ -111,7 +143,16 @@ class ImageValidator(
+                     cursor.getString(index)
+                 }
+             }
+-        }.getOrNull()
++        } catch (error: SecurityException) {
++            Log.d(TAG, "Display-name query blocked by permission for uri=$uri")
++            null
++        } catch (error: IllegalArgumentException) {
++            Log.d(TAG, "Display-name query failed due to invalid uri=$uri")
++            null
++        } catch (error: IllegalStateException) {
++            Log.d(TAG, "Display-name query failed due to provider state for uri=$uri")
++            null
++        }
+         return fromMetadata ?: uri.lastPathSegment
+     }
+ 
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/media/MediaStoreVideoWriter.kt b/src/main/kotlin/com/example/arspatialpinning/platform/media/MediaStoreVideoWriter.kt
+index bc0049b..b96d99c 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/platform/media/MediaStoreVideoWriter.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/media/MediaStoreVideoWriter.kt
+@@ -5,6 +5,8 @@ import android.content.ContentValues
+ import android.net.Uri
+ import android.os.ParcelFileDescriptor
+ import android.provider.MediaStore
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
+ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.Locale
+@@ -16,10 +18,11 @@ class MediaStoreVideoWriter(
+ 
+     data class PendingOutput(
+         val uri: Uri,
++        val displayName: String,
+         val fileDescriptor: ParcelFileDescriptor
+     )
+ 
+-    fun createPendingOutput(): PendingOutput {
++    fun createPendingOutput(): AppResult<PendingOutput> {
+         val fileName = generateFileName(nowProvider())
+         val contentValues = ContentValues().apply {
+             put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+@@ -28,26 +31,71 @@ class MediaStoreVideoWriter(
+             put(MediaStore.Video.Media.IS_PENDING, 1)
+         }
+ 
+-        val uri = checkNotNull(
++        val uri = try {
+             contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
+-        ) { "Failed to insert MediaStore item for recording." }
++        } catch (error: SecurityException) {
++            return AppResult.Failure(AppError.OutputCreationFailed())
++        } catch (error: IllegalArgumentException) {
++            return AppResult.Failure(AppError.OutputCreationFailed())
++        } catch (error: IllegalStateException) {
++            return AppResult.Failure(AppError.OutputCreationFailed())
++        }
++        if (uri == null) {
++            return AppResult.Failure(AppError.OutputCreationFailed())
++        }
+ 
+-        val pfd = checkNotNull(contentResolver.openFileDescriptor(uri, "rw")) {
+-            "Failed to open file descriptor for MediaStore recording output."
++        val pfd = try {
++            contentResolver.openFileDescriptor(uri, "rw")
++        } catch (error: SecurityException) {
++            deleteOutput(uri)
++            null
++        } catch (error: IllegalArgumentException) {
++            deleteOutput(uri)
++            null
++        } catch (error: IllegalStateException) {
++            deleteOutput(uri)
++            null
++        }
++        if (pfd == null) {
++            return AppResult.Failure(AppError.OutputCreationFailed())
+         }
+ 
+-        return PendingOutput(uri = uri, fileDescriptor = pfd)
++        return AppResult.Success(
++            PendingOutput(
++                uri = uri,
++                displayName = fileName,
++                fileDescriptor = pfd
++            )
++        )
+     }
+ 
+-    fun finalizeOutput(uri: Uri) {
++    fun finalizeOutput(uri: Uri): AppResult<Unit> {
+         val finalizeValues = ContentValues().apply {
+             put(MediaStore.Video.Media.IS_PENDING, 0)
+         }
+-        contentResolver.update(uri, finalizeValues, null, null)
++        return try {
++            contentResolver.update(uri, finalizeValues, null, null)
++            AppResult.Success(Unit)
++        } catch (error: SecurityException) {
++            AppResult.Failure(AppError.OutputFinalizeFailed())
++        } catch (error: IllegalArgumentException) {
++            AppResult.Failure(AppError.OutputFinalizeFailed())
++        } catch (error: IllegalStateException) {
++            AppResult.Failure(AppError.OutputFinalizeFailed())
++        }
+     }
+ 
+-    fun deleteOutput(uri: Uri) {
+-        contentResolver.delete(uri, null, null)
++    fun deleteOutput(uri: Uri): AppResult<Unit> {
++        return try {
++            contentResolver.delete(uri, null, null)
++            AppResult.Success(Unit)
++        } catch (error: SecurityException) {
++            AppResult.Failure(AppError.OutputCleanupFailed())
++        } catch (error: IllegalArgumentException) {
++            AppResult.Failure(AppError.OutputCleanupFailed())
++        } catch (error: IllegalStateException) {
++            AppResult.Failure(AppError.OutputCleanupFailed())
++        }
+     }
+ 
+     fun generateFileName(date: Date): String {
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingController.kt b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingController.kt
+index e8cc23c..3b0db8c 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingController.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingController.kt
+@@ -3,11 +3,12 @@ package com.example.arspatialpinning.platform.media
+ import android.content.Intent
+ import android.graphics.Rect
+ import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
+ 
+ interface RecordingController {
+     var onProjectionStopped: (() -> Unit)?
+ 
+-    fun createConsentIntent(): Intent
++    fun createConsentIntent(): AppResult<Intent>
+ 
+     suspend fun startRecording(
+         consentResultCode: Int,
+@@ -15,7 +16,7 @@ interface RecordingController {
+         maximumWindowBounds: Rect
+     ): AppResult<Unit>
+ 
+-    suspend fun stopRecording(): AppResult<Unit>
++    suspend fun stopRecording(): AppResult<RecordedVideoArtifact?>
+ 
+     fun release()
+ }
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingControllerImpl.kt b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingControllerImpl.kt
+index 16eaef5..64336fb 100644
+--- a/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingControllerImpl.kt
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingControllerImpl.kt
+@@ -14,43 +14,62 @@ import android.os.Build
+ import android.os.Handler
+ import android.os.Looper
+ import android.os.ParcelFileDescriptor
++import android.os.SystemClock
+ import com.example.arspatialpinning.common.AppError
+ import com.example.arspatialpinning.common.AppResult
+ import com.example.arspatialpinning.common.Logger
++import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
++import com.example.arspatialpinning.platform.rayneo.RayneoAudioModeController
++import com.example.arspatialpinning.platform.rayneo.RayneoDeviceDetector
++import java.io.IOException
++import java.util.concurrent.ExecutionException
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.TimeoutException
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.ExecutorCoroutineDispatcher
+ import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.asCoroutineDispatcher
+ import kotlinx.coroutines.cancel
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
+ import kotlin.math.max
+ import kotlin.math.min
+ 
+ class RecordingControllerImpl(
+     private val context: Context,
+-    private val logger: Logger
++    private val logger: Logger,
++    private val rayneoDeviceDetector: RayneoDeviceDetector,
++    private val rayneoAudioModeController: RayneoAudioModeController,
++    private val mediaStoreVideoWriter: MediaStoreVideoWriter =
++        MediaStoreVideoWriter(context.contentResolver),
++    private val recordedFileValidator: RecordedFileValidator =
++        RecordedFileValidator(context, context.contentResolver)
+ ) : RecordingController {
+     override var onProjectionStopped: (() -> Unit)? = null
+ 
+     private val mediaProjectionManager: MediaProjectionManager by lazy {
+         context.getSystemService(MediaProjectionManager::class.java)
+     }
+-    private val mediaStoreVideoWriter = MediaStoreVideoWriter(context.contentResolver)
+-    private val recordedFileValidator = RecordedFileValidator(context, context.contentResolver)
+     private val mutex = Mutex()
++    private val controllerDispatcher: ExecutorCoroutineDispatcher =
++        Executors.newSingleThreadExecutor { runnable ->
++            Thread(runnable, "RecordingControllerThread").apply { isDaemon = true }
++        }.asCoroutineDispatcher()
+     private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+ 
+     private var activeSession: ActiveSession? = null
+ 
+-    override fun createConsentIntent(): Intent {
++    override fun createConsentIntent(): AppResult<Intent> {
+         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+-            mediaProjectionManager.createScreenCaptureIntent(
+-                MediaProjectionConfig.createConfigForUserChoice()
+-            )
++            createConsentIntentApi34()
+         } else {
+-            mediaProjectionManager.createScreenCaptureIntent()
++            createConsentIntentLegacy()
+         }
+     }
+ 
+@@ -58,146 +77,210 @@ class RecordingControllerImpl(
+         consentResultCode: Int,
+         consentData: Intent,
+         maximumWindowBounds: Rect
+-    ): AppResult<Unit> = mutex.withLock {
+-        if (activeSession != null) {
+-            return@withLock AppResult.Failure(AppError.RecordingFailure("Recording is already active."))
+-        }
++    ): AppResult<Unit> = withContext(controllerDispatcher) {
++        mutex.withLock {
++            if (activeSession != null) {
++                return@withLock AppResult.Failure(AppError.RecordingFailure("Recording is already active."))
++            }
+ 
+-        val captureSize = computeCaptureSize(maximumWindowBounds)
+-        val densityDpi = context.resources.displayMetrics.densityDpi
++            val captureSize = computeCaptureSize(maximumWindowBounds)
++            val densityDpi = context.resources.displayMetrics.densityDpi
+ 
+-        var pendingOutput: MediaStoreVideoWriter.PendingOutput? = null
+-        var recorder: MediaRecorder? = null
+-        var projection: MediaProjection? = null
+-        var callback: MediaProjection.Callback? = null
+-        var virtualDisplay: VirtualDisplay? = null
++            when (val serviceStart = startRecordingService()) {
++                is AppResult.Success -> Unit
++                is AppResult.Failure -> return@withLock serviceStart
++            }
+ 
+-        try {
+-            // Foreground service must be active before obtaining MediaProjection (Android 14+).
+-            RecordingService.start(context)
++            val projection = when (val projectionResult = acquireProjection(consentResultCode, consentData)) {
++                is AppResult.Failure -> {
++                    stopRecordingService()
++                    return@withLock projectionResult
++                }
+ 
+-            projection = mediaProjectionManager.getMediaProjection(consentResultCode, consentData)
+-                ?: return@withLock AppResult.Failure(AppError.MediaProjectionDenied())
++                is AppResult.Success -> projectionResult.value
++            }
+ 
+-            pendingOutput = try {
+-                mediaStoreVideoWriter.createPendingOutput()
+-            } catch (t: Throwable) {
+-                logger.e(TAG, "Failed to create MediaStore output.", t)
+-                return@withLock AppResult.Failure(AppError.OutputCreationFailed())
++            val pendingOutput = when (val outputResult = mediaStoreVideoWriter.createPendingOutput()) {
++                is AppResult.Failure -> {
++                    releaseSessionResources(
++                        mediaRecorder = null,
++                        virtualDisplay = null,
++                        mediaProjection = projection,
++                        projectionCallback = null,
++                        outputPfd = null
++                    )
++                    stopRecordingService()
++                    return@withLock outputResult
++                }
++
++                is AppResult.Success -> outputResult.value
+             }
+ 
+-            recorder = createRecorder(
+-                outputFileDescriptor = pendingOutput.fileDescriptor,
+-                width = captureSize.width,
+-                height = captureSize.height
+-            )
++            val rayneoPolicyPrepared = when (val policyResult = prepareRayneoPolicyIfNeeded()) {
++                is AppResult.Failure -> {
++                    cleanupStartFailure(
++                        mediaRecorder = null,
++                        virtualDisplay = null,
++                        mediaProjection = projection,
++                        projectionCallback = null,
++                        outputPfd = pendingOutput.fileDescriptor,
++                        pendingOutputUri = pendingOutput.uri,
++                        restoreRayneoPolicy = false
++                    )
++                    return@withLock policyResult
++                }
+ 
+-            recorder.setOnInfoListener { _, what, _ ->
+-                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+-                    callbackScope.launch {
+-                        logger.d(TAG, "Max recording duration reached.")
+-                        stopRecording()
+-                        onProjectionStopped?.invoke()
+-                    }
++                is AppResult.Success -> policyResult.value
++            }
++
++            val recorder = when (
++                val recorderResult = createRecorder(
++                    outputFileDescriptor = pendingOutput.fileDescriptor,
++                    width = captureSize.width,
++                    height = captureSize.height
++                )
++            ) {
++                is AppResult.Failure -> {
++                    cleanupStartFailure(
++                        mediaRecorder = null,
++                        virtualDisplay = null,
++                        mediaProjection = projection,
++                        projectionCallback = null,
++                        outputPfd = pendingOutput.fileDescriptor,
++                        pendingOutputUri = pendingOutput.uri,
++                        restoreRayneoPolicy = rayneoPolicyPrepared
++                    )
++                    return@withLock recorderResult
+                 }
++
++                is AppResult.Success -> recorderResult.value
+             }
+-            recorder.setOnErrorListener { _, _, _ ->
+-                callbackScope.launch {
+-                    logger.e(TAG, "Recorder reported fatal error.")
+-                    stopRecording()
+-                    onProjectionStopped?.invoke()
++
++            configureRecorderCallbacks(recorder)
++
++            when (val prepareResult = prepareRecorder(recorder)) {
++                is AppResult.Failure -> {
++                    cleanupStartFailure(
++                        mediaRecorder = recorder,
++                        virtualDisplay = null,
++                        mediaProjection = projection,
++                        projectionCallback = null,
++                        outputPfd = pendingOutput.fileDescriptor,
++                        pendingOutputUri = pendingOutput.uri,
++                        restoreRayneoPolicy = rayneoPolicyPrepared
++                    )
++                    return@withLock prepareResult
+                 }
++
++                is AppResult.Success -> Unit
+             }
+ 
+-            callback = object : MediaProjection.Callback() {
+-                override fun onStop() {
+-                    callbackScope.launch {
+-                        logger.d(TAG, "MediaProjection stopped by the system.")
+-                        stopRecording()
+-                        onProjectionStopped?.invoke()
+-                    }
++            val callback = projectionCallback()
++            when (val registerResult = registerProjectionCallback(projection, callback)) {
++                is AppResult.Failure -> {
++                    cleanupStartFailure(
++                        mediaRecorder = recorder,
++                        virtualDisplay = null,
++                        mediaProjection = projection,
++                        projectionCallback = null,
++                        outputPfd = pendingOutput.fileDescriptor,
++                        pendingOutputUri = pendingOutput.uri,
++                        restoreRayneoPolicy = rayneoPolicyPrepared
++                    )
++                    return@withLock registerResult
+                 }
++
++                is AppResult.Success -> Unit
+             }
+-            projection.registerCallback(callback, Handler(Looper.getMainLooper()))
+ 
+-            virtualDisplay = projection.createVirtualDisplay(
+-                VIRTUAL_DISPLAY_NAME,
+-                captureSize.width,
+-                captureSize.height,
+-                densityDpi,
+-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+-                recorder.surface,
+-                null,
+-                null
+-            )
++            val virtualDisplay = when (
++                val displayResult = createVirtualDisplay(
++                    projection = projection,
++                    recorder = recorder,
++                    captureSize = captureSize,
++                    densityDpi = densityDpi
++                )
++            ) {
++                is AppResult.Failure -> {
++                    cleanupStartFailure(
++                        mediaRecorder = recorder,
++                        virtualDisplay = null,
++                        mediaProjection = projection,
++                        projectionCallback = callback,
++                        outputPfd = pendingOutput.fileDescriptor,
++                        pendingOutputUri = pendingOutput.uri,
++                        restoreRayneoPolicy = rayneoPolicyPrepared
++                    )
++                    return@withLock displayResult
++                }
+ 
+-            recorder.start()
++                is AppResult.Success -> displayResult.value
++            }
++
++            when (val startResult = startRecorder(recorder)) {
++                is AppResult.Failure -> {
++                    cleanupStartFailure(
++                        mediaRecorder = recorder,
++                        virtualDisplay = virtualDisplay,
++                        mediaProjection = projection,
++                        projectionCallback = callback,
++                        outputPfd = pendingOutput.fileDescriptor,
++                        pendingOutputUri = pendingOutput.uri,
++                        restoreRayneoPolicy = rayneoPolicyPrepared
++                    )
++                    return@withLock startResult
++                }
++
++                is AppResult.Success -> Unit
++            }
+ 
+             activeSession = ActiveSession(
+                 outputUri = pendingOutput.uri,
++                outputDisplayName = pendingOutput.displayName,
+                 outputPfd = pendingOutput.fileDescriptor,
+                 mediaProjection = projection,
+                 projectionCallback = callback,
+                 virtualDisplay = virtualDisplay,
+-                mediaRecorder = recorder
++                mediaRecorder = recorder,
++                rayneoPolicyPrepared = rayneoPolicyPrepared,
++                startedAtElapsedRealtimeMs = SystemClock.elapsedRealtime()
+             )
+ 
+             logger.d(TAG, "Recording started at ${captureSize.width}x${captureSize.height}.")
+             AppResult.Success(Unit)
+-        } catch (t: Throwable) {
+-            logger.e(TAG, "Failed to start recording.", t)
+-            safelyRelease(
+-                mediaRecorder = recorder,
+-                virtualDisplay = virtualDisplay,
+-                mediaProjection = projection,
+-                projectionCallback = callback,
+-                outputPfd = pendingOutput?.fileDescriptor
+-            )
+-            pendingOutput?.uri?.let(mediaStoreVideoWriter::deleteOutput)
+-            RecordingService.stop(context)
+-            AppResult.Failure(AppError.RecorderStartFailed())
+         }
+     }
+ 
+-    override suspend fun stopRecording(): AppResult<Unit> = mutex.withLock {
+-        val current = activeSession ?: return@withLock AppResult.Success(Unit)
+-        activeSession = null
++    override suspend fun stopRecording(): AppResult<RecordedVideoArtifact?> = withContext(controllerDispatcher) {
++        mutex.withLock {
++            val current = activeSession ?: return@withLock AppResult.Success(null)
++            activeSession = null
+ 
+-        var stopSucceeded = true
+-        try {
+-            current.mediaRecorder.stop()
+-        } catch (t: Throwable) {
+-            stopSucceeded = false
+-            logger.e(TAG, "Recorder stop failed.", t)
+-        }
+-
+-        safelyRelease(
+-            mediaRecorder = current.mediaRecorder,
+-            virtualDisplay = current.virtualDisplay,
+-            mediaProjection = current.mediaProjection,
+-            projectionCallback = current.projectionCallback,
+-            outputPfd = current.outputPfd
+-        )
++            val stopResult = stopActiveRecorder(current)
+ 
+-        val result = if (stopSucceeded) {
+-            when (val validation = recordedFileValidator.validate(current.outputUri)) {
+-                is AppResult.Success -> {
+-                    mediaStoreVideoWriter.finalizeOutput(current.outputUri)
+-                    AppResult.Success(Unit)
+-                }
++            releaseSessionResources(
++                mediaRecorder = current.mediaRecorder,
++                virtualDisplay = current.virtualDisplay,
++                mediaProjection = current.mediaProjection,
++                projectionCallback = current.projectionCallback,
++                outputPfd = current.outputPfd
++            )
+ 
++            val artifactResult = when (stopResult) {
+                 is AppResult.Failure -> {
+-                    mediaStoreVideoWriter.deleteOutput(current.outputUri)
+-                    validation
++                    deleteOutput(current.outputUri)
++                    stopResult
+                 }
++
++                is AppResult.Success -> finalizeValidatedRecording(current)
+             }
+-        } else {
+-            mediaStoreVideoWriter.deleteOutput(current.outputUri)
+-            AppResult.Failure(AppError.RecorderStopFailed())
+-        }
+ 
+-        RecordingService.stop(context)
+-        result
++            if (current.rayneoPolicyPrepared) {
++                rayneoAudioModeController.restoreDefaultAudioPolicy()
++            }
++            stopRecordingService()
++            artifactResult
++        }
+     }
+ 
+     override fun release() {
+@@ -205,60 +288,456 @@ class RecordingControllerImpl(
+             stopRecording()
+         }
+         callbackScope.coroutineContext.cancel()
++        controllerDispatcher.close()
++    }
++
++    private fun createConsentIntentLegacy(): AppResult<Intent> {
++        return try {
++            AppResult.Success(mediaProjectionManager.createScreenCaptureIntent())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to create media projection consent intent.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to create media projection consent intent.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to create media projection consent intent.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        }
++    }
++
++    private fun createConsentIntentApi34(): AppResult<Intent> {
++        val directAttempt = try {
++            AppResult.Success(mediaProjectionManager.createScreenCaptureIntent())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Falling back to explicit media projection consent config.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Falling back to explicit media projection consent config.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Falling back to explicit media projection consent config.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        }
++        if (directAttempt is AppResult.Success) {
++            return directAttempt
++        }
++
++        return try {
++            AppResult.Success(
++                mediaProjectionManager.createScreenCaptureIntent(
++                    MediaProjectionConfig.createConfigForDefaultDisplay()
++                )
++            )
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to create fallback media projection consent intent.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to create fallback media projection consent intent.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to create fallback media projection consent intent.", error)
++            AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        }
++    }
++
++    private fun acquireProjection(consentResultCode: Int, consentData: Intent): AppResult<MediaProjection> {
++        return try {
++            val projection = mediaProjectionManager.getMediaProjection(consentResultCode, consentData)
++            if (projection == null) {
++                AppResult.Failure(AppError.MediaProjectionDenied())
++            } else {
++                AppResult.Success(projection)
++            }
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to acquire MediaProjection.", error)
++            AppResult.Failure(AppError.MediaProjectionDenied())
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to acquire MediaProjection.", error)
++            AppResult.Failure(AppError.MediaProjectionDenied())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to acquire MediaProjection.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        }
++    }
++
++    private fun prepareRayneoPolicyIfNeeded(): AppResult<Boolean> {
++        if (!rayneoDeviceDetector.isX3Device()) {
++            return AppResult.Success(false)
++        }
++
++        return when (val prepare = rayneoAudioModeController.prepareForVideoRecording()) {
++            is AppResult.Success -> AppResult.Success(true)
++            is AppResult.Failure -> {
++                if (prepare.error is AppError.RayneoAudioPolicySetupFailed) {
++                    prepare
++                } else {
++                    AppResult.Failure(AppError.RayneoAudioPolicySetupFailed())
++                }
++            }
++        }
+     }
+ 
+     private fun createRecorder(
+         outputFileDescriptor: ParcelFileDescriptor,
+         width: Int,
+         height: Int
+-    ): MediaRecorder {
+-        return MediaRecorder(context).apply {
+-            setAudioSource(MediaRecorder.AudioSource.MIC)
+-            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+-            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+-            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+-            setVideoFrameRate(VIDEO_FRAME_RATE)
+-            setVideoEncodingBitRate(VIDEO_BIT_RATE)
+-            setVideoSize(width, height)
+-            setMaxDuration(MAX_DURATION_MS)
+-            setOutputFile(outputFileDescriptor.fileDescriptor)
+-            prepare()
+-        }
+-    }
+-
+-    private fun safelyRelease(
++    ): AppResult<MediaRecorder> {
++        return try {
++            val recorder = MediaRecorder(context).apply {
++                setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
++                setVideoSource(MediaRecorder.VideoSource.SURFACE)
++                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
++                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
++                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
++                setVideoFrameRate(VIDEO_FRAME_RATE)
++                setVideoEncodingBitRate(VIDEO_BIT_RATE)
++                setVideoSize(width, height)
++                setMaxDuration(MAX_DURATION_MS)
++                setOutputFile(outputFileDescriptor.fileDescriptor)
++            }
++            AppResult.Success(recorder)
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to configure MediaRecorder.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to configure MediaRecorder.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to configure MediaRecorder.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        }
++    }
++
++    private fun configureRecorderCallbacks(recorder: MediaRecorder) {
++        recorder.setOnInfoListener { _, what, _ ->
++            if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
++                callbackScope.launch {
++                    logger.d(TAG, "Max recording duration reached.")
++                    onProjectionStopped?.invoke()
++                }
++            }
++        }
++        recorder.setOnErrorListener { _, _, _ ->
++            callbackScope.launch {
++                logger.e(TAG, "Recorder reported fatal error.")
++                onProjectionStopped?.invoke()
++            }
++        }
++    }
++
++    private fun prepareRecorder(recorder: MediaRecorder): AppResult<Unit> {
++        return try {
++            recorder.prepare()
++            AppResult.Success(Unit)
++        } catch (error: IOException) {
++            logger.e(TAG, "MediaRecorder.prepare() failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "MediaRecorder.prepare() failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "MediaRecorder.prepare() failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        }
++    }
++
++    private fun projectionCallback(): MediaProjection.Callback {
++        return object : MediaProjection.Callback() {
++            override fun onStop() {
++                callbackScope.launch {
++                    logger.d(TAG, "MediaProjection stopped by the system.")
++                    onProjectionStopped?.invoke()
++                }
++            }
++        }
++    }
++
++    private fun registerProjectionCallback(
++        projection: MediaProjection,
++        callback: MediaProjection.Callback
++    ): AppResult<Unit> {
++        return try {
++            projection.registerCallback(callback, Handler(Looper.getMainLooper()))
++            AppResult.Success(Unit)
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to register MediaProjection callback.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to register MediaProjection callback.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to register MediaProjection callback.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        }
++    }
++
++    private fun createVirtualDisplay(
++        projection: MediaProjection,
++        recorder: MediaRecorder,
++        captureSize: CaptureSize,
++        densityDpi: Int
++    ): AppResult<VirtualDisplay> {
++        return try {
++            val virtualDisplay = projection.createVirtualDisplay(
++                VIRTUAL_DISPLAY_NAME,
++                captureSize.width,
++                captureSize.height,
++                densityDpi,
++                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
++                recorder.surface,
++                null,
++                null
++            )
++            if (virtualDisplay == null) {
++                AppResult.Failure(AppError.RecorderStartFailed())
++            } else {
++                AppResult.Success(virtualDisplay)
++            }
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to create virtual display.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to create virtual display.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Failed to create virtual display.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        }
++    }
++
++    private fun startRecorder(recorder: MediaRecorder): AppResult<Unit> {
++        return try {
++            recorder.start()
++            AppResult.Success(Unit)
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "MediaRecorder.start() failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "MediaRecorder.start() failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        }
++    }
++
++    private suspend fun stopActiveRecorder(session: ActiveSession): AppResult<Unit> {
++        val elapsedMs = SystemClock.elapsedRealtime() - session.startedAtElapsedRealtimeMs
++        if (elapsedMs < MIN_RECORDER_STOP_DELAY_MS) {
++            delay(MIN_RECORDER_STOP_DELAY_MS - elapsedMs)
++        }
++        return stopRecorderWithTimeout(session.mediaRecorder)
++    }
++
++    private fun stopRecorderWithTimeout(mediaRecorder: MediaRecorder): AppResult<Unit> {
++        val executor = Executors.newSingleThreadExecutor { runnable ->
++            Thread(runnable, "MediaRecorderStopThread").apply { isDaemon = true }
++        }
++
++        return try {
++            val stopFuture = executor.submit<Boolean> {
++                try {
++                    mediaRecorder.stop()
++                    true
++                } catch (error: IllegalStateException) {
++                    logger.e(TAG, "Recorder stop call threw.", error)
++                    false
++                } catch (error: RuntimeException) {
++                    logger.e(TAG, "Recorder stop call threw.", error)
++                    false
++                }
++            }
++
++            try {
++                val stopped = stopFuture.get(STOP_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
++                if (stopped) {
++                    AppResult.Success(Unit)
++                } else {
++                    AppResult.Failure(AppError.RecorderStopFailed())
++                }
++            } catch (timeout: TimeoutException) {
++                logger.e(TAG, "Recorder stop timed out.", timeout)
++                stopFuture.cancel(true)
++                AppResult.Failure(AppError.RecorderStopFailed())
++            } catch (error: InterruptedException) {
++                Thread.currentThread().interrupt()
++                logger.e(TAG, "Recorder stop interrupted.", error)
++                AppResult.Failure(AppError.RecorderStopFailed())
++            } catch (error: ExecutionException) {
++                logger.e(TAG, "Recorder stop execution failed.", error)
++                AppResult.Failure(AppError.RecorderStopFailed())
++            }
++        } finally {
++            executor.shutdownNow()
++        }
++    }
++
++    private fun finalizeValidatedRecording(session: ActiveSession): AppResult<RecordedVideoArtifact> {
++        return when (val validation = recordedFileValidator.validate(session.outputUri)) {
++            is AppResult.Failure -> {
++                deleteOutput(session.outputUri)
++                validation
++            }
++
++            is AppResult.Success -> {
++                when (val finalize = mediaStoreVideoWriter.finalizeOutput(session.outputUri)) {
++                    is AppResult.Success -> AppResult.Success(
++                        RecordedVideoArtifact(
++                            sourceUri = session.outputUri,
++                            displayName = session.outputDisplayName
++                        )
++                    )
++
++                    is AppResult.Failure -> {
++                        deleteOutput(session.outputUri)
++                        finalize
++                    }
++                }
++            }
++        }
++    }
++
++    private fun cleanupStartFailure(
++        mediaRecorder: MediaRecorder?,
++        virtualDisplay: VirtualDisplay?,
++        mediaProjection: MediaProjection?,
++        projectionCallback: MediaProjection.Callback?,
++        outputPfd: ParcelFileDescriptor?,
++        pendingOutputUri: Uri,
++        restoreRayneoPolicy: Boolean
++    ) {
++        releaseSessionResources(
++            mediaRecorder = mediaRecorder,
++            virtualDisplay = virtualDisplay,
++            mediaProjection = mediaProjection,
++            projectionCallback = projectionCallback,
++            outputPfd = outputPfd
++        )
++        deleteOutput(pendingOutputUri)
++        if (restoreRayneoPolicy) {
++            rayneoAudioModeController.restoreDefaultAudioPolicy()
++        }
++        stopRecordingService()
++    }
++
++    private fun releaseSessionResources(
+         mediaRecorder: MediaRecorder?,
+         virtualDisplay: VirtualDisplay?,
+         mediaProjection: MediaProjection?,
+         projectionCallback: MediaProjection.Callback?,
+         outputPfd: ParcelFileDescriptor?
+     ) {
++        safelyResetRecorder(mediaRecorder)
++        safelyReleaseRecorder(mediaRecorder)
++        safelyReleaseVirtualDisplay(virtualDisplay)
++        safelyUnregisterProjectionCallback(mediaProjection, projectionCallback)
++        safelyStopProjection(mediaProjection)
++        safelyCloseOutput(outputPfd)
++    }
++
++    private fun safelyResetRecorder(mediaRecorder: MediaRecorder?) {
++        if (mediaRecorder == null) {
++            return
++        }
+         try {
+-            mediaRecorder?.reset()
+-        } catch (_: Throwable) {
++            mediaRecorder.reset()
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "MediaRecorder reset failed: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "MediaRecorder reset failed: ${error.message}")
++        }
++    }
++
++    private fun safelyReleaseRecorder(mediaRecorder: MediaRecorder?) {
++        if (mediaRecorder == null) {
++            return
++        }
++        try {
++            mediaRecorder.release()
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "MediaRecorder release failed: ${error.message}")
++        }
++    }
++
++    private fun safelyReleaseVirtualDisplay(virtualDisplay: VirtualDisplay?) {
++        if (virtualDisplay == null) {
++            return
+         }
+         try {
+-            mediaRecorder?.release()
+-        } catch (_: Throwable) {
++            virtualDisplay.release()
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "VirtualDisplay release failed: ${error.message}")
++        }
++    }
++
++    private fun safelyUnregisterProjectionCallback(
++        mediaProjection: MediaProjection?,
++        projectionCallback: MediaProjection.Callback?
++    ) {
++        if (mediaProjection == null || projectionCallback == null) {
++            return
+         }
+         try {
+-            virtualDisplay?.release()
+-        } catch (_: Throwable) {
++            mediaProjection.unregisterCallback(projectionCallback)
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "MediaProjection callback unregister failed: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "MediaProjection callback unregister failed: ${error.message}")
++        }
++    }
++
++    private fun safelyStopProjection(mediaProjection: MediaProjection?) {
++        if (mediaProjection == null) {
++            return
+         }
+         try {
+-            if (projectionCallback != null) {
+-                mediaProjection?.unregisterCallback(projectionCallback)
+-            }
+-        } catch (_: Throwable) {
++            mediaProjection.stop()
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "MediaProjection stop failed: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "MediaProjection stop failed: ${error.message}")
++        }
++    }
++
++    private fun safelyCloseOutput(outputPfd: ParcelFileDescriptor?) {
++        if (outputPfd == null) {
++            return
+         }
+         try {
+-            mediaProjection?.stop()
+-        } catch (_: Throwable) {
++            outputPfd.close()
++        } catch (error: IOException) {
++            logger.d(TAG, "Output descriptor close failed: ${error.message}")
+         }
++    }
++
++    private fun deleteOutput(uri: Uri) {
++        when (val deleteResult = mediaStoreVideoWriter.deleteOutput(uri)) {
++            is AppResult.Success -> Unit
++            is AppResult.Failure -> logger.e(TAG, "Failed to delete recording output: $uri", null)
++        }
++    }
++
++    private fun stopRecordingService() {
+         try {
+-            outputPfd?.close()
+-        } catch (_: Throwable) {
++            RecordingService.stop(context)
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "Recording service stop failed: ${error.message}")
++        } catch (error: RuntimeException) {
++            logger.d(TAG, "Recording service stop failed: ${error.message}")
++        }
++    }
++
++    private fun startRecordingService(): AppResult<Unit> {
++        return try {
++            RecordingService.start(context)
++            AppResult.Success(Unit)
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Recording service start failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Recording service start failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
++        } catch (error: RuntimeException) {
++            logger.e(TAG, "Recording service start failed.", error)
++            AppResult.Failure(AppError.RecorderStartFailed())
+         }
+     }
+ 
+@@ -291,11 +770,14 @@ class RecordingControllerImpl(
+ 
+     private data class ActiveSession(
+         val outputUri: Uri,
++        val outputDisplayName: String,
+         val outputPfd: ParcelFileDescriptor,
+         val mediaProjection: MediaProjection,
+         val projectionCallback: MediaProjection.Callback,
+-        val virtualDisplay: VirtualDisplay?,
+-        val mediaRecorder: MediaRecorder
++        val virtualDisplay: VirtualDisplay,
++        val mediaRecorder: MediaRecorder,
++        val rayneoPolicyPrepared: Boolean,
++        val startedAtElapsedRealtimeMs: Long
+     )
+ 
+     private data class CaptureSize(
+@@ -311,5 +793,7 @@ class RecordingControllerImpl(
+         private const val MAX_DURATION_MS = 10 * 60 * 1000
+         private const val MAX_CAPTURE_WIDTH = 1080
+         private const val MAX_CAPTURE_HEIGHT = 1920
++        private const val MIN_RECORDER_STOP_DELAY_MS = 1_000L
++        private const val STOP_CALL_TIMEOUT_MS = 4_000L
+     }
+ }
+diff --git a/src/test/kotlin/com/example/arspatialpinning/feature/ar/ArViewModelTest.kt b/src/test/kotlin/com/example/arspatialpinning/feature/ar/ArViewModelTest.kt
+index dcb8344..f513dd2 100644
+--- a/src/test/kotlin/com/example/arspatialpinning/feature/ar/ArViewModelTest.kt
++++ b/src/test/kotlin/com/example/arspatialpinning/feature/ar/ArViewModelTest.kt
+@@ -1,13 +1,12 @@
+ package com.example.arspatialpinning.feature.ar
+ 
+-import android.app.Activity
+ import android.app.Application
++import android.app.Activity
+ import android.content.Intent
+ import android.graphics.Bitmap
+ import android.graphics.Rect
+ import android.net.Uri
+ import androidx.arch.core.executor.testing.InstantTaskExecutorRule
+-import app.cash.turbine.test
+ import com.example.arspatialpinning.common.AppError
+ import com.example.arspatialpinning.common.AppResult
+ import com.example.arspatialpinning.common.DefaultDispatcherProvider
+@@ -19,11 +18,13 @@ import com.example.arspatialpinning.domain.model.PlacementMode
+ import com.example.arspatialpinning.domain.model.PlacementTransform
+ import com.example.arspatialpinning.domain.model.PreparedRenderAsset
+ import com.example.arspatialpinning.domain.model.PreviewRenderState
++import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
+ import com.example.arspatialpinning.domain.model.RecordingState
+ import com.example.arspatialpinning.domain.model.RenderAssetState
+ import com.example.arspatialpinning.domain.model.SelectedImage
+ import com.example.arspatialpinning.domain.usecase.ConfirmRepositionUseCase
+ import com.example.arspatialpinning.domain.usecase.DeleteImageUseCase
++import com.example.arspatialpinning.domain.usecase.DownloadRecordingUseCase
+ import com.example.arspatialpinning.domain.usecase.EnterRepositionModeUseCase
+ import com.example.arspatialpinning.domain.usecase.LoadImageUseCase
+ import com.example.arspatialpinning.domain.usecase.PlaceImageUseCase
+@@ -38,11 +39,12 @@ import com.example.arspatialpinning.platform.file.ImageUriReader
+ import com.example.arspatialpinning.platform.file.ImageValidationResult
+ import com.example.arspatialpinning.platform.file.ImageValidator
+ import com.example.arspatialpinning.platform.media.RecordingController
++import com.example.arspatialpinning.platform.media.RecordingExporter
++import com.example.arspatialpinning.platform.media.SharedRecordingStateHolder
+ import com.google.ar.core.Frame
+ import com.google.ar.core.Session
+ import com.google.android.filament.Engine
+ import io.github.sceneview.node.Node
+-import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.test.StandardTestDispatcher
+@@ -52,7 +54,6 @@ import kotlinx.coroutines.test.resetMain
+ import kotlinx.coroutines.test.runTest
+ import kotlinx.coroutines.test.setMain
+ import org.junit.Assert.assertEquals
+-import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNull
+ import org.junit.Assert.assertTrue
+ import org.junit.Rule
+@@ -83,8 +84,7 @@ class ArViewModelTest {
+         )
+         val viewModel = buildViewModel(
+             loadImageUseCase = fakeLoadImageUseCase,
+-            arSceneController = fakeArController,
+-            recordingController = FakeRecordingController()
++            arSceneController = fakeArController
+         )
+ 
+         viewModel.onImageSelected(Uri.parse("content://test/success.png"))
+@@ -101,13 +101,9 @@ class ArViewModelTest {
+         val fakeArController = FakeArSceneController().apply {
+             prepareResult = AppResult.Failure(AppError.PreviewRenderCreationFailed("Preview failed"))
+         }
+-        val fakeLoadImageUseCase = FakeLoadImageUseCase(
+-            result = AppResult.Success(createSelectedImage(selectionRevision = 2L))
+-        )
+         val viewModel = buildViewModel(
+-            loadImageUseCase = fakeLoadImageUseCase,
+-            arSceneController = fakeArController,
+-            recordingController = FakeRecordingController()
++            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 2L))),
++            arSceneController = fakeArController
+         )
+ 
+         viewModel.onImageSelected(Uri.parse("content://test/failure.png"))
+@@ -126,8 +122,7 @@ class ArViewModelTest {
+         }
+         val viewModel = buildViewModel(
+             loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 3L))),
+-            arSceneController = fakeArController,
+-            recordingController = FakeRecordingController()
++            arSceneController = fakeArController
+         )
+ 
+         viewModel.onImageSelected(Uri.parse("content://test/metadata-only.png"))
+@@ -142,8 +137,7 @@ class ArViewModelTest {
+         val fakeArController = FakeArSceneController()
+         val viewModel = buildViewModel(
+             loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 4L))),
+-            arSceneController = fakeArController,
+-            recordingController = FakeRecordingController()
++            arSceneController = fakeArController
+         )
+ 
+         viewModel.setUiStateForTest(
+@@ -173,141 +167,82 @@ class ArViewModelTest {
+     }
+ 
+     @Test
+-    fun recordClick_withoutMicrophonePermission_requestsPermission() = runTest {
+-        val viewModel = buildViewModel(
+-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 5L))),
+-            arSceneController = FakeArSceneController(),
+-            recordingController = FakeRecordingController()
+-        )
+-        viewModel.onArScreenResumed()
+-        viewModel.setUiStateForTest(ArUiState(isArReady = true))
+-
+-        viewModel.sideEffects.test {
+-            viewModel.onUiEvent(
+-                event = ArUiEvent.RecordClicked,
+-                hasRecordAudioPermission = false
++    fun onRouteExit_clearsArState_butKeepsSharedRecordingState() = runTest {
++        val fakeArController = FakeArSceneController()
++        val fakeRecordingController = FakeRecordingController().apply {
++            stopResult = AppResult.Success(
++                RecordedVideoArtifact(
++                    sourceUri = Uri.parse("content://recordings/validated.mp4"),
++                    displayName = "validated.mp4"
++                )
+             )
+-            advanceUntilIdle()
+-
+-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Preparing)
+-            assertEquals(ArSideEffect.RequestRecordAudioPermission, awaitItem())
+-            cancelAndIgnoreRemainingEvents()
+         }
+-    }
+-
+-    @Test
+-    fun mediaProjectionDenied_resetsIdle_andShowsSnackbar() = runTest {
+-        val viewModel = buildViewModel(
+-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 6L))),
+-            arSceneController = FakeArSceneController(),
+-            recordingController = FakeRecordingController()
++        val sharedHolder = createSharedRecordingStateHolder(
++            recordingController = fakeRecordingController,
++            recordingExporter = FakeRecordingExporter()
+         )
+-        viewModel.onArScreenResumed()
+-        viewModel.setUiStateForTest(ArUiState(isArReady = true))
+-
+-        viewModel.sideEffects.test {
+-            viewModel.onUiEvent(
+-                event = ArUiEvent.RecordClicked,
+-                hasRecordAudioPermission = true
+-            )
+-            advanceUntilIdle()
+-            assertTrue(awaitItem() is ArSideEffect.RequestMediaProjectionConsent)
+-
+-            viewModel.onMediaProjectionConsentResult(
+-                resultCode = Activity.RESULT_CANCELED,
+-                data = null
+-            )
+-            advanceUntilIdle()
+-
+-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Idle)
+-            val effect = awaitItem()
+-            assertTrue(effect is ArSideEffect.ShowSnackbar)
+-            cancelAndIgnoreRemainingEvents()
+-        }
+-    }
++        sharedHolder.onAppResumed()
++        sharedHolder.onRecordAudioPermissionStateObserved(true)
++        sharedHolder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
++        advanceUntilIdle()
++        sharedHolder.onStopRecordClick(showSavedMessage = false)
++        advanceUntilIdle()
+ 
+-    @Test
+-    fun stopRecording_isIdempotentWhileFinalizing() = runTest {
+-        val fakeRecordingController = FakeRecordingController()
+-        val stopGate = CompletableDeferred<Unit>()
+-        fakeRecordingController.stopCompletion = stopGate
+         val viewModel = buildViewModel(
+-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 7L))),
+-            arSceneController = FakeArSceneController(),
+-            recordingController = fakeRecordingController
++            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 10L))),
++            arSceneController = fakeArController,
++            sharedRecordingStateHolder = sharedHolder
+         )
+-        viewModel.onArScreenResumed()
+-        viewModel.setUiStateForTest(ArUiState(isArReady = true))
+-
+-        viewModel.sideEffects.test {
+-            viewModel.onUiEvent(ArUiEvent.RecordClicked, hasRecordAudioPermission = true)
+-            advanceUntilIdle()
+-            assertTrue(awaitItem() is ArSideEffect.RequestMediaProjectionConsent)
+-
+-            viewModel.onMediaProjectionConsentResult(
+-                resultCode = Activity.RESULT_OK,
+-                data = Intent("projection-consent")
++        val recordingArtifact = sharedHolder.uiState.value.lastCompletedRecording
++        viewModel.setUiStateForTest(
++            ArUiState(
++                hasCameraPermission = true,
++                isArReady = true,
++                selectedImage = createSelectedImage(selectionRevision = 10L),
++                renderAssetState = RenderAssetState.Error("x"),
++                previewRenderState = PreviewRenderState.Error("x")
+             )
+-            advanceUntilIdle()
+-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Active)
+-
+-            viewModel.onUiEvent(ArUiEvent.StopRecordingClicked, hasRecordAudioPermission = true)
+-            viewModel.onUiEvent(ArUiEvent.StopRecordingClicked, hasRecordAudioPermission = true)
+-            advanceUntilIdle()
+-
+-            assertEquals(1, fakeRecordingController.stopCalls)
+-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Finalizing)
+-            stopGate.complete(Unit)
+-            advanceUntilIdle()
+-
+-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Idle)
+-            cancelAndIgnoreRemainingEvents()
+-        }
+-    }
+-
+-    @Test
+-    fun onRouteExit_clearsState_andReleasesControllers() = runTest {
+-        val fakeArController = FakeArSceneController()
+-        val fakeRecordingController = FakeRecordingController()
+-        val viewModel = buildViewModel(
+-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 8L))),
+-            arSceneController = fakeArController,
+-            recordingController = fakeRecordingController
+         )
+ 
+         viewModel.onRouteExit()
+         advanceUntilIdle()
+ 
+         assertEquals(1, fakeArController.releaseCalls)
+-        assertEquals(1, fakeRecordingController.stopCalls)
+-        assertEquals(ArUiState(), viewModel.uiState.value)
++        assertTrue(viewModel.uiState.value.recordingState is RecordingState.Idle)
++        assertEquals(recordingArtifact, viewModel.uiState.value.lastCompletedRecording)
++        assertEquals(RenderAssetState.None, viewModel.uiState.value.renderAssetState)
++        assertEquals(PreviewRenderState.HiddenNoSelection, viewModel.uiState.value.previewRenderState)
++        assertNull(viewModel.uiState.value.selectedImage)
++        sharedHolder.release()
+     }
+ 
+     @Test
+-    fun onCameraPermissionStateObserved_revoked_disablesArReadiness() = runTest {
++    fun sharedRecordingPermission_isMirroredIntoArUiState() = runTest {
++        val fakeRecordingController = FakeRecordingController()
++        val sharedHolder = createSharedRecordingStateHolder(
++            recordingController = fakeRecordingController,
++            recordingExporter = FakeRecordingExporter()
++        )
+         val viewModel = buildViewModel(
+-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 9L))),
++            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 11L))),
+             arSceneController = FakeArSceneController(),
+-            recordingController = FakeRecordingController()
++            sharedRecordingStateHolder = sharedHolder
+         )
+ 
+-        viewModel.setUiStateForTest(
+-            ArUiState(
+-                hasCameraPermission = true,
+-                isArReady = true
+-            )
+-        )
+-
+-        viewModel.onCameraPermissionStateObserved(granted = false)
++        sharedHolder.onRecordAudioPermissionStateObserved(true)
++        advanceUntilIdle()
+ 
+-        assertFalse(viewModel.uiState.value.hasCameraPermission)
+-        assertFalse(viewModel.uiState.value.isArReady)
++        assertTrue(viewModel.uiState.value.hasRecordAudioPermission)
++        sharedHolder.release()
+     }
+ 
+     private fun buildViewModel(
+         loadImageUseCase: LoadImageUseCase,
+         arSceneController: ArSceneController,
+-        recordingController: RecordingController
++        sharedRecordingStateHolder: SharedRecordingStateHolder = createSharedRecordingStateHolder(
++            recordingController = FakeRecordingController(),
++            recordingExporter = FakeRecordingExporter()
++        )
+     ): ArViewModel {
+         val context = RuntimeEnvironment.getApplication() as Application
+ 
+@@ -318,11 +253,21 @@ class ArViewModelTest {
+             deleteImageUseCase = DeleteImageUseCase(),
+             enterRepositionModeUseCase = EnterRepositionModeUseCase(),
+             confirmRepositionUseCase = ConfirmRepositionUseCase(),
++            arAvailabilityChecker = ArAvailabilityChecker(context),
++            arSceneController = arSceneController,
++            sharedRecordingStateHolder = sharedRecordingStateHolder
++        )
++    }
++
++    private fun createSharedRecordingStateHolder(
++        recordingController: RecordingController,
++        recordingExporter: RecordingExporter
++    ): SharedRecordingStateHolder {
++        return SharedRecordingStateHolder(
+             requestRecordingUseCase = RequestRecordingUseCase(),
+             startRecordingUseCase = StartRecordingUseCase(recordingController),
+             stopRecordingUseCase = StopRecordingUseCase(recordingController),
+-            arAvailabilityChecker = ArAvailabilityChecker(context),
+-            arSceneController = arSceneController,
++            downloadRecordingUseCase = DownloadRecordingUseCase(recordingExporter),
+             recordingController = recordingController
+         )
+     }
+@@ -447,11 +392,10 @@ class ArViewModelTest {
+     }
+ 
+     private class FakeRecordingController : RecordingController {
+-        var stopCalls: Int = 0
+-        var stopCompletion: CompletableDeferred<Unit>? = null
++        var stopResult: AppResult<RecordedVideoArtifact?> = AppResult.Success(null)
+         override var onProjectionStopped: (() -> Unit)? = null
+ 
+-        override fun createConsentIntent(): Intent = Intent("projection-consent")
++        override fun createConsentIntent(): AppResult<Intent> = AppResult.Success(Intent("projection-consent"))
+ 
+         override suspend fun startRecording(
+             consentResultCode: Int,
+@@ -459,15 +403,17 @@ class ArViewModelTest {
+             maximumWindowBounds: Rect
+         ): AppResult<Unit> = AppResult.Success(Unit)
+ 
+-        override suspend fun stopRecording(): AppResult<Unit> {
+-            stopCalls += 1
+-            stopCompletion?.await()
+-            return AppResult.Success(Unit)
+-        }
++        override suspend fun stopRecording(): AppResult<RecordedVideoArtifact?> = stopResult
+ 
+         override fun release() = Unit
+     }
+ 
++    private class FakeRecordingExporter : RecordingExporter {
++        override suspend fun exportRecording(sourceUri: Uri, destinationUri: Uri): AppResult<Unit> {
++            return AppResult.Success(Unit)
++        }
++    }
++
+     class MainDispatcherRule(
+         private val dispatcher: TestDispatcher = StandardTestDispatcher()
+     ) : TestWatcher() {
+@@ -479,4 +425,5 @@ class ArViewModelTest {
+             Dispatchers.resetMain()
+         }
+     }
++
+ }
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/file/UriStreamOpener.kt b/src/main/kotlin/com/example/arspatialpinning/platform/file/UriStreamOpener.kt
+new file mode 100644
+index 0000000..deba462
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/file/UriStreamOpener.kt
+@@ -0,0 +1,157 @@
++package com.example.arspatialpinning.platform.file
++
++import android.content.ContentResolver
++import android.net.Uri
++import android.os.ParcelFileDescriptor
++import android.util.Log
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import java.io.FileNotFoundException
++import java.io.IOException
++import java.io.InputStream
++
++interface UriStreamOpener {
++    fun openForRead(uri: Uri): AppResult<InputStream>
++}
++
++class ContentResolverUriStreamOpener(
++    private val contentResolver: ContentResolver
++) : UriStreamOpener {
++
++    override fun openForRead(uri: Uri): AppResult<InputStream> {
++        val attempt = UriStreamOpenAttempt(
++            primary = { contentResolver.openInputStream(uri) },
++            secondary = { contentResolver.openAssetFileDescriptor(uri, "r")?.createInputStream() },
++            tertiary = {
++                contentResolver.openFileDescriptor(uri, "r")?.let { descriptor ->
++                    ParcelFileDescriptor.AutoCloseInputStream(descriptor)
++                }
++            },
++            quaternary = { openTypedStream(uri) },
++            onFailure = { source, error ->
++                Log.w(TAG, "Failed to open selected image using $source for uri=$uri", error)
++            }
++        )
++        val stream = attempt.open()
++        if (stream is AppResult.Failure) {
++            Log.e(TAG, "Unable to open selected image from any resolver path. uri=$uri")
++        }
++        return stream
++    }
++
++    private fun openTypedStream(uri: Uri): InputStream? {
++        val streamTypes = try {
++            contentResolver.getStreamTypes(uri, MIME_ANY)
++        } catch (error: SecurityException) {
++            Log.w(TAG, "Failed to resolve typed stream candidates for uri=$uri", error)
++            null
++        } catch (error: IllegalArgumentException) {
++            Log.w(TAG, "Failed to resolve typed stream candidates for uri=$uri", error)
++            null
++        } catch (error: IllegalStateException) {
++            Log.w(TAG, "Failed to resolve typed stream candidates for uri=$uri", error)
++            null
++        }
++        val candidates = typedMimeCandidates(streamTypes)
++        for (mimeType in candidates) {
++            try {
++                val stream = contentResolver
++                    .openTypedAssetFileDescriptor(uri, mimeType, null)
++                    ?.createInputStream()
++                if (stream != null) {
++                    return stream
++                }
++            } catch (error: FileNotFoundException) {
++                Log.w(TAG, "Failed typed stream open using mime=$mimeType uri=$uri", error)
++            } catch (error: IOException) {
++                Log.w(TAG, "Failed typed stream open using mime=$mimeType uri=$uri", error)
++            } catch (error: SecurityException) {
++                Log.w(TAG, "Failed typed stream open using mime=$mimeType uri=$uri", error)
++            } catch (error: IllegalArgumentException) {
++                Log.w(TAG, "Failed typed stream open using mime=$mimeType uri=$uri", error)
++            } catch (error: IllegalStateException) {
++                Log.w(TAG, "Failed typed stream open using mime=$mimeType uri=$uri", error)
++            } catch (error: UnsupportedOperationException) {
++                Log.w(TAG, "Failed typed stream open using mime=$mimeType uri=$uri", error)
++            }
++        }
++        return null
++    }
++
++    private companion object {
++        const val TAG = "UriStreamOpener"
++        const val MIME_PNG = "image/png"
++        const val MIME_JPEG = "image/jpeg"
++        const val MIME_JPG = "image/jpg"
++        const val MIME_IMAGE_WILDCARD = "image/*"
++        const val MIME_ANY = "*/*"
++    }
++}
++
++internal fun typedMimeCandidates(streamTypes: Array<String>?): List<String> {
++    val dynamicTypes = streamTypes.orEmpty()
++    val preferred = dynamicTypes.filter { it == "image/png" || it == "image/jpeg" || it == "image/jpg" }
++    val orderedDynamic = preferred + dynamicTypes.filterNot { it in preferred }
++    val staticFallback = listOf("image/png", "image/jpeg", "image/jpg", "image/*", "*/*")
++    return (orderedDynamic + staticFallback)
++        .map { it.trim() }
++        .filter { it.isNotEmpty() }
++        .distinct()
++}
++
++internal class UriStreamOpenAttempt(
++    private val primary: () -> InputStream?,
++    private val secondary: () -> InputStream?,
++    private val tertiary: () -> InputStream?,
++    private val quaternary: () -> InputStream?,
++    private val onFailure: (source: String, error: Throwable) -> Unit = { _, _ -> }
++) {
++
++    fun open(): AppResult<InputStream> {
++        val attempts = listOf(
++            "openInputStream" to primary,
++            "openAssetFileDescriptor" to secondary,
++            "openFileDescriptor" to tertiary,
++            "openTypedAssetFileDescriptor" to quaternary
++        )
++        for ((source, block) in attempts) {
++            when (val attempt = tryOpen(source, block)) {
++                is UriStreamOpenStep.Opened -> return AppResult.Success(attempt.stream)
++                is UriStreamOpenStep.Failed -> {
++                    onFailure(source, attempt.error)
++                }
++                UriStreamOpenStep.Unavailable -> Unit
++            }
++        }
++        return AppResult.Failure(AppError.FileOpenFailed())
++    }
++
++    private fun tryOpen(source: String, block: () -> InputStream?): UriStreamOpenStep {
++        return try {
++            val stream = block()
++            if (stream != null) {
++                UriStreamOpenStep.Opened(stream)
++            } else {
++                UriStreamOpenStep.Unavailable
++            }
++        } catch (error: FileNotFoundException) {
++            UriStreamOpenStep.Failed(error)
++        } catch (error: IOException) {
++            UriStreamOpenStep.Failed(error)
++        } catch (error: SecurityException) {
++            UriStreamOpenStep.Failed(error)
++        } catch (error: IllegalArgumentException) {
++            UriStreamOpenStep.Failed(error)
++        } catch (error: IllegalStateException) {
++            UriStreamOpenStep.Failed(error)
++        } catch (error: UnsupportedOperationException) {
++            UriStreamOpenStep.Failed(error)
++        }
++    }
++
++    private sealed interface UriStreamOpenStep {
++        data class Opened(val stream: InputStream) : UriStreamOpenStep
++        data class Failed(val error: Throwable) : UriStreamOpenStep
++        data object Unavailable : UriStreamOpenStep
++    }
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/file/UriReadPermissionGuard.kt b/src/main/kotlin/com/example/arspatialpinning/platform/file/UriReadPermissionGuard.kt
+new file mode 100644
+index 0000000..f1df3c1
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/file/UriReadPermissionGuard.kt
+@@ -0,0 +1,35 @@
++package com.example.arspatialpinning.platform.file
++
++import android.content.ContentResolver
++import android.net.Uri
++import android.util.Log
++
++interface UriReadPermissionGuard {
++    fun <T> withReadPermission(uri: Uri, block: () -> T): T
++}
++
++object NoOpUriReadPermissionGuard : UriReadPermissionGuard {
++    override fun <T> withReadPermission(uri: Uri, block: () -> T): T = block()
++}
++
++class ContentResolverUriReadPermissionGuard(
++    private val contentResolver: ContentResolver
++) : UriReadPermissionGuard {
++
++    override fun <T> withReadPermission(uri: Uri, block: () -> T): T {
++        try {
++            contentResolver.openFileDescriptor(uri, "r")?.close()
++        } catch (error: SecurityException) {
++            Log.d(TAG, "Temporary read-permission probe failed for uri=$uri", error)
++        } catch (error: IllegalArgumentException) {
++            Log.d(TAG, "Temporary read-permission probe failed for uri=$uri", error)
++        } catch (error: IllegalStateException) {
++            Log.d(TAG, "Temporary read-permission probe failed for uri=$uri", error)
++        }
++        return block()
++    }
++
++    private companion object {
++        const val TAG = "UriPermissionGuard"
++    }
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/rayneo/RayneoDeviceDetector.kt b/src/main/kotlin/com/example/arspatialpinning/platform/rayneo/RayneoDeviceDetector.kt
+new file mode 100644
+index 0000000..5594815
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/rayneo/RayneoDeviceDetector.kt
+@@ -0,0 +1,68 @@
++package com.example.arspatialpinning.platform.rayneo
++
++import com.example.arspatialpinning.common.Logger
++import java.lang.reflect.InvocationTargetException
++
++interface RayneoDeviceDetector {
++    fun isX3Device(): Boolean
++}
++
++class RayneoDeviceDetectorImpl(
++    private val logger: Logger
++) : RayneoDeviceDetector {
++    override fun isX3Device(): Boolean {
++        DEVICE_UTIL_CLASS_NAMES.forEach { className ->
++            val detected = detectX3ByClass(className)
++            if (detected != null) {
++                return detected
++            }
++        }
++        return false
++    }
++
++    private fun detectX3ByClass(className: String): Boolean? {
++        return try {
++            val clazz = Class.forName(className)
++            val method = clazz.methods.firstOrNull { method ->
++                method.name == METHOD_IS_X3_DEVICE &&
++                    method.parameterTypes.isEmpty()
++            } ?: return null
++            method.invoke(null) as? Boolean
++        } catch (error: ClassNotFoundException) {
++            logger.d(TAG, "RayNeo DeviceUtil class not found for $className")
++            null
++        } catch (error: SecurityException) {
++            logger.d(TAG, "RayNeo DeviceUtil lookup blocked for $className: ${error.message}")
++            null
++        } catch (error: InvocationTargetException) {
++            logger.d(TAG, "RayNeo DeviceUtil invocation failed for $className: ${error.targetException?.message ?: error.message}")
++            null
++        } catch (error: IllegalAccessException) {
++            logger.d(TAG, "RayNeo DeviceUtil invocation inaccessible for $className: ${error.message}")
++            null
++        } catch (error: IllegalArgumentException) {
++            logger.d(TAG, "RayNeo DeviceUtil invocation invalid for $className: ${error.message}")
++            null
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "RayNeo DeviceUtil invocation failed for $className: ${error.message}")
++            null
++        } catch (error: LinkageError) {
++            logger.d(TAG, "RayNeo DeviceUtil linkage failed for $className: ${error.message}")
++            null
++        } catch (error: RuntimeException) {
++            // Reflection target implementations may throw vendor runtime exceptions.
++            logger.d(TAG, "RayNeo DeviceUtil runtime failure for $className: ${error.message}")
++            null
++        }
++    }
++
++    private companion object {
++        const val TAG = "RayneoDeviceDetector"
++        const val METHOD_IS_X3_DEVICE = "isX3Device"
++        val DEVICE_UTIL_CLASS_NAMES = listOf(
++            "com.rayneo.utils.DeviceUtil",
++            "com.rayneo.device.DeviceUtil",
++            "com.rayneo.sdk.utils.DeviceUtil"
++        )
++    }
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/rayneo/RayneoAudioModeController.kt b/src/main/kotlin/com/example/arspatialpinning/platform/rayneo/RayneoAudioModeController.kt
+new file mode 100644
+index 0000000..be3696f
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/rayneo/RayneoAudioModeController.kt
+@@ -0,0 +1,146 @@
++package com.example.arspatialpinning.platform.rayneo
++
++import android.content.Context
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.common.Logger
++import java.lang.reflect.InvocationTargetException
++
++interface RayneoAudioModeController {
++    fun prepareForVideoRecording(): AppResult<Unit>
++    fun restoreDefaultAudioPolicy()
++}
++
++class RayneoAudioModeControllerImpl(
++    private val context: Context,
++    private val logger: Logger
++) : RayneoAudioModeController {
++
++    private var prepared: Boolean = false
++
++    override fun prepareForVideoRecording(): AppResult<Unit> {
++        val success = AUDIO_POLICY_CLASS_CANDIDATES.any { className ->
++            invokePrepareForVideoRecording(className)
++        }
++
++        if (!success) {
++            prepared = false
++            return AppResult.Failure(AppError.RayneoAudioPolicySetupFailed())
++        }
++
++        prepared = true
++        return AppResult.Success(Unit)
++    }
++
++    override fun restoreDefaultAudioPolicy() {
++        if (!prepared) {
++            return
++        }
++
++        AUDIO_POLICY_CLASS_CANDIDATES.forEach { className ->
++            restoreDefaultPolicy(className)
++        }
++
++        prepared = false
++    }
++
++    private fun invokePrepareForVideoRecording(className: String): Boolean {
++        return try {
++            val clazz = Class.forName(className)
++            val instance = buildAudioPolicyInstance(clazz) ?: return false
++            val method = clazz.methods.firstOrNull { method ->
++                method.name == METHOD_PREPARE_VIDEO_RECORDING &&
++                    method.parameterTypes.isEmpty()
++            } ?: return false
++            val result = method.invoke(instance)
++            result as? Boolean ?: true
++        } catch (error: ClassNotFoundException) {
++            logger.d(TAG, "RayNeo audio policy class not found for $className")
++            false
++        } catch (error: SecurityException) {
++            logger.d(TAG, "RayNeo audio prepare blocked for $className: ${error.message}")
++            false
++        } catch (error: InvocationTargetException) {
++            logger.d(TAG, "RayNeo audio prepare invocation failed for $className: ${error.targetException?.message ?: error.message}")
++            false
++        } catch (error: IllegalAccessException) {
++            logger.d(TAG, "RayNeo audio prepare inaccessible for $className: ${error.message}")
++            false
++        } catch (error: IllegalArgumentException) {
++            logger.d(TAG, "RayNeo audio prepare invalid for $className: ${error.message}")
++            false
++        } catch (error: IllegalStateException) {
++            logger.d(TAG, "RayNeo audio prepare state failure for $className: ${error.message}")
++            false
++        } catch (error: LinkageError) {
++            logger.d(TAG, "RayNeo audio prepare linkage failure for $className: ${error.message}")
++            false
++        } catch (error: RuntimeException) {
++            // Reflection target implementations may throw vendor runtime exceptions.
++            logger.d(TAG, "RayNeo audio prepare runtime failure for $className: ${error.message}")
++            false
++        }
++    }
++
++    private fun restoreDefaultPolicy(className: String) {
++        try {
++            val clazz = Class.forName(className)
++            val instance = buildAudioPolicyInstance(clazz) ?: return
++            val method = clazz.methods.firstOrNull { method ->
++                method.name == METHOD_RESTORE_DEFAULT_POLICY &&
++                    method.parameterTypes.isEmpty()
++            } ?: return
++            method.invoke(instance)
++        } catch (error: ClassNotFoundException) {
++            logger.d(TAG, "RayNeo audio policy class not found for $className")
++        } catch (error: SecurityException) {
++            logger.e(TAG, "RayNeo audio restore blocked for $className: ${error.message}", error)
++        } catch (error: InvocationTargetException) {
++            logger.e(TAG, "RayNeo audio restore invocation failed for $className: ${error.targetException?.message ?: error.message}", error.targetException ?: error)
++        } catch (error: IllegalAccessException) {
++            logger.e(TAG, "RayNeo audio restore inaccessible for $className: ${error.message}", error)
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "RayNeo audio restore invalid for $className: ${error.message}", error)
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "RayNeo audio restore state failure for $className: ${error.message}", error)
++        } catch (error: LinkageError) {
++            logger.e(TAG, "RayNeo audio restore linkage failure for $className: ${error.message}", error)
++        } catch (error: RuntimeException) {
++            // Reflection target implementations may throw vendor runtime exceptions.
++            logger.e(TAG, "RayNeo audio restore runtime failure for $className: ${error.message}", error)
++        }
++    }
++
++    private fun buildAudioPolicyInstance(clazz: Class<*>): Any? {
++        val getInstanceWithContext = clazz.methods.firstOrNull { method ->
++            method.name == METHOD_GET_INSTANCE &&
++                method.parameterTypes.size == 1 &&
++                method.parameterTypes.firstOrNull() == Context::class.java
++        }
++        if (getInstanceWithContext != null) {
++            return getInstanceWithContext.invoke(null, context)
++        }
++
++        val getInstanceNoArgs = clazz.methods.firstOrNull { method ->
++            method.name == METHOD_GET_INSTANCE &&
++                method.parameterTypes.isEmpty()
++        }
++        if (getInstanceNoArgs != null) {
++            return getInstanceNoArgs.invoke(null)
++        }
++
++        return null
++    }
++
++    private companion object {
++        const val TAG = "RayneoAudioModeCtrl"
++        const val METHOD_GET_INSTANCE = "getInstance"
++        const val METHOD_PREPARE_VIDEO_RECORDING = "prepareForVideoRecording"
++        const val METHOD_RESTORE_DEFAULT_POLICY = "restoreDefaultAudioPolicy"
++        val AUDIO_POLICY_CLASS_CANDIDATES = listOf(
++            "com.rayneo.audio.RayneoAudioModeController",
++            "com.rayneo.audio.AudioPolicyController",
++            "com.rayneo.sdk.audio.AudioPolicyController"
++        )
++    }
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingExporter.kt b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingExporter.kt
+new file mode 100644
+index 0000000..ae68cc1
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordingExporter.kt
+@@ -0,0 +1,122 @@
++package com.example.arspatialpinning.platform.media
++
++import android.content.ContentResolver
++import android.net.Uri
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.common.DispatcherProvider
++import com.example.arspatialpinning.common.Logger
++import kotlinx.coroutines.withContext
++import java.io.IOException
++import java.io.InputStream
++import java.io.OutputStream
++
++interface RecordingExporter {
++    suspend fun exportRecording(sourceUri: Uri, destinationUri: Uri): AppResult<Unit>
++}
++
++class ContentResolverRecordingExporter(
++    private val contentResolver: ContentResolver,
++    private val dispatchers: DispatcherProvider,
++    private val logger: Logger
++) : RecordingExporter {
++    override suspend fun exportRecording(sourceUri: Uri, destinationUri: Uri): AppResult<Unit> {
++        return withContext(dispatchers.io) {
++            when (val source = openSourceStream(sourceUri)) {
++                is AppResult.Failure -> source
++                is AppResult.Success -> {
++                    source.value.use { sourceStream ->
++                        when (val destination = openDestinationStream(destinationUri)) {
++                            is AppResult.Failure -> destination
++                            is AppResult.Success -> destination.value.use { destinationStream ->
++                                copyStreams(
++                                    sourceUri = sourceUri,
++                                    destinationUri = destinationUri,
++                                    sourceStream = sourceStream,
++                                    destinationStream = destinationStream
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private fun copyStreams(
++        sourceUri: Uri,
++        destinationUri: Uri,
++        sourceStream: InputStream,
++        destinationStream: OutputStream
++    ): AppResult<Unit> {
++        return try {
++            sourceStream.copyTo(destinationStream, DEFAULT_BUFFER_SIZE)
++            destinationStream.flush()
++            AppResult.Success(Unit)
++        } catch (error: IOException) {
++            logger.e(TAG, "Failed while exporting recording from $sourceUri to $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed while exporting recording from $sourceUri to $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed while exporting recording from $sourceUri to $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed while exporting recording from $sourceUri to $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        }
++    }
++
++    private fun openSourceStream(sourceUri: Uri): AppResult<InputStream> {
++        return try {
++            val stream = contentResolver.openInputStream(sourceUri)
++            if (stream == null) {
++                logger.e(TAG, "Failed to open source stream for export: $sourceUri", null)
++                AppResult.Failure(AppError.DownloadExportFailed())
++            } else {
++                AppResult.Success(stream)
++            }
++        } catch (error: IOException) {
++            logger.e(TAG, "Failed to open source stream for export: $sourceUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to open source stream for export: $sourceUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to open source stream for export: $sourceUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to open source stream for export: $sourceUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        }
++    }
++
++    private fun openDestinationStream(destinationUri: Uri): AppResult<OutputStream> {
++        return try {
++            val stream = contentResolver.openOutputStream(destinationUri, "w")
++            if (stream == null) {
++                logger.e(TAG, "Failed to open destination stream for export: $destinationUri", null)
++                AppResult.Failure(AppError.DownloadExportFailed())
++            } else {
++                AppResult.Success(stream)
++            }
++        } catch (error: IOException) {
++            logger.e(TAG, "Failed to open destination stream for export: $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: SecurityException) {
++            logger.e(TAG, "Failed to open destination stream for export: $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: IllegalArgumentException) {
++            logger.e(TAG, "Failed to open destination stream for export: $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        } catch (error: IllegalStateException) {
++            logger.e(TAG, "Failed to open destination stream for export: $destinationUri", error)
++            AppResult.Failure(AppError.DownloadExportFailed())
++        }
++    }
++
++    private companion object {
++        const val TAG = "RecordingExporter"
++    }
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordedFileValidator.kt b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordedFileValidator.kt
+new file mode 100644
+index 0000000..bd31f28
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/media/RecordedFileValidator.kt
+@@ -0,0 +1,163 @@
++package com.example.arspatialpinning.platform.media
++
++import android.content.ContentResolver
++import android.content.Context
++import android.media.MediaExtractor
++import android.media.MediaFormat
++import android.media.MediaMetadataRetriever
++import android.net.Uri
++import android.util.Log
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import java.io.IOException
++
++class RecordedFileValidator(
++    private val context: Context,
++    private val contentResolver: ContentResolver
++) {
++    fun validate(uri: Uri): AppResult<Unit> {
++        val sizeBytes = when (val size = readSize(uri)) {
++            is AppResult.Failure -> return size
++            is AppResult.Success -> size.value
++        }
++
++        if (sizeBytes <= 0) {
++            return AppResult.Failure(AppError.RecordedFileInvalid("Recorded file is empty."))
++        }
++
++        val trackInspection = when (val tracks = inspectTracks(uri)) {
++            is AppResult.Failure -> return tracks
++            is AppResult.Success -> tracks.value
++        }
++
++        val durationMs = when (val duration = readDuration(uri)) {
++            is AppResult.Failure -> return duration
++            is AppResult.Success -> duration.value
++        }
++
++        if (!RecordedFileValidationRules.isValid(
++                sizeBytes = sizeBytes,
++                hasVideoTrack = trackInspection.hasVideoTrack,
++                hasAudioTrack = trackInspection.hasAudioTrack,
++                durationMs = durationMs
++            )
++        ) {
++            return AppResult.Failure(AppError.RecordedFileInvalid())
++        }
++
++        return AppResult.Success(Unit)
++    }
++
++    private fun readSize(uri: Uri): AppResult<Long> {
++        return try {
++            val size = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
++                descriptor.statSize
++            } ?: return AppResult.Failure(AppError.RecordedFileInvalid("Recorded file could not be opened."))
++            AppResult.Success(size)
++        } catch (error: IOException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file could not be opened."))
++        } catch (error: SecurityException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file could not be opened."))
++        } catch (error: IllegalArgumentException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file could not be opened."))
++        } catch (error: IllegalStateException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file could not be opened."))
++        }
++    }
++
++    private fun inspectTracks(uri: Uri): AppResult<TrackInspection> {
++        val extractor = MediaExtractor()
++        return try {
++            extractor.setDataSource(context, uri, null)
++            var hasVideoTrack = false
++            var hasAudioTrack = false
++            repeat(extractor.trackCount) { index ->
++                val format = extractor.getTrackFormat(index)
++                val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
++                if (mime.startsWith("video/")) {
++                    hasVideoTrack = true
++                }
++                if (mime.startsWith("audio/")) {
++                    hasAudioTrack = true
++                }
++            }
++            AppResult.Success(TrackInspection(hasVideoTrack = hasVideoTrack, hasAudioTrack = hasAudioTrack))
++        } catch (error: IOException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file is not a valid MP4."))
++        } catch (error: SecurityException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file is not a valid MP4."))
++        } catch (error: IllegalArgumentException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file is not a valid MP4."))
++        } catch (error: IllegalStateException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file is not a valid MP4."))
++        } catch (error: RuntimeException) {
++            // MediaExtractor may throw codec/runtime errors for malformed files.
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file is not a valid MP4."))
++        } finally {
++            releaseExtractor(extractor)
++        }
++    }
++
++    private fun readDuration(uri: Uri): AppResult<Long> {
++        val retriever = MediaMetadataRetriever()
++        return try {
++            retriever.setDataSource(context, uri)
++            val duration = retriever
++                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
++                ?.toLongOrNull()
++                ?: 0L
++            AppResult.Success(duration)
++        } catch (error: RuntimeException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file duration could not be read."))
++        } catch (error: IllegalArgumentException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file duration could not be read."))
++        } catch (error: IllegalStateException) {
++            AppResult.Failure(AppError.RecordedFileInvalid("Recorded file duration could not be read."))
++        } finally {
++            releaseRetriever(retriever)
++        }
++    }
++
++    private fun releaseExtractor(extractor: MediaExtractor) {
++        try {
++            extractor.release()
++        } catch (error: IllegalStateException) {
++            Log.d(TAG, "MediaExtractor release failed.", error)
++        } catch (error: RuntimeException) {
++            // MediaExtractor release can fail when initialization did not complete.
++            Log.d(TAG, "MediaExtractor release failed.", error)
++        }
++    }
++
++    private fun releaseRetriever(retriever: MediaMetadataRetriever) {
++        try {
++            retriever.release()
++        } catch (error: RuntimeException) {
++            // MediaMetadataRetriever release can fail when initialization did not complete.
++            Log.d(TAG, "MediaMetadataRetriever release failed.", error)
++        }
++    }
++
++    private data class TrackInspection(
++        val hasVideoTrack: Boolean,
++        val hasAudioTrack: Boolean
++    )
++
++    private companion object {
++        const val TAG = "RecordedFileValidator"
++    }
++}
++
++internal object RecordedFileValidationRules {
++    fun isValid(
++        sizeBytes: Long,
++        hasVideoTrack: Boolean,
++        hasAudioTrack: Boolean,
++        durationMs: Long
++    ): Boolean {
++        return sizeBytes > 0 &&
++            hasVideoTrack &&
++            hasAudioTrack &&
++            durationMs >= 300L
++    }
++}
+diff --git a/src/main/kotlin/com/example/arspatialpinning/platform/media/SharedRecordingStateHolder.kt b/src/main/kotlin/com/example/arspatialpinning/platform/media/SharedRecordingStateHolder.kt
+new file mode 100644
+index 0000000..25f0957
+--- /dev/null
++++ b/src/main/kotlin/com/example/arspatialpinning/platform/media/SharedRecordingStateHolder.kt
+@@ -0,0 +1,321 @@
++package com.example.arspatialpinning.platform.media
++
++import android.app.Activity
++import android.content.Intent
++import android.graphics.Rect
++import android.net.Uri
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
++import com.example.arspatialpinning.domain.model.RecordingState
++import com.example.arspatialpinning.domain.usecase.DownloadRecordingUseCase
++import com.example.arspatialpinning.domain.usecase.RequestRecordingUseCase
++import com.example.arspatialpinning.domain.usecase.StartRecordingUseCase
++import com.example.arspatialpinning.domain.usecase.StopRecordingUseCase
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharedFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++
++data class SharedRecordingUiState(
++    val recordingState: RecordingState = RecordingState.Idle,
++    val lastCompletedRecording: RecordedVideoArtifact? = null,
++    val hasRecordAudioPermission: Boolean = false,
++    val isAppResumed: Boolean = false,
++    val transientMessage: String? = null
++) {
++    val canRecord: Boolean = isAppResumed && recordingState is RecordingState.Idle
++    val canDownloadRecording: Boolean =
++        recordingState is RecordingState.Idle && lastCompletedRecording != null
++}
++
++sealed interface SharedRecordingSideEffect {
++    data object RequestRecordAudioPermission : SharedRecordingSideEffect
++    data class RequestMediaProjectionConsent(val intent: Intent) : SharedRecordingSideEffect
++    data class LaunchDownloadDestinationPicker(val suggestedFileName: String) : SharedRecordingSideEffect
++    data class ShowSnackbar(val message: String) : SharedRecordingSideEffect
++}
++
++class SharedRecordingStateHolder(
++    private val requestRecordingUseCase: RequestRecordingUseCase,
++    private val startRecordingUseCase: StartRecordingUseCase,
++    private val stopRecordingUseCase: StopRecordingUseCase,
++    private val downloadRecordingUseCase: DownloadRecordingUseCase,
++    private val recordingController: RecordingController
++) {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
++    private val transitionMutex = Mutex()
++
++    private val _uiState = MutableStateFlow(SharedRecordingUiState())
++    val uiState: StateFlow<SharedRecordingUiState> = _uiState.asStateFlow()
++
++    private val _sideEffects = MutableSharedFlow<SharedRecordingSideEffect>()
++    val sideEffects: SharedFlow<SharedRecordingSideEffect> = _sideEffects.asSharedFlow()
++
++    private var maximumWindowBounds = Rect(0, 0, DEFAULT_CAPTURE_WIDTH, DEFAULT_CAPTURE_HEIGHT)
++    private var pendingStartAfterPermission = false
++    private var pendingStopAfterPreparing = false
++
++    init {
++        recordingController.onProjectionStopped = {
++            scope.launch {
++                requestStopRecording(showSavedMessage = false, force = true)
++                emitSnackbar(AppError.RecorderStoppedUnexpectedly().message)
++            }
++        }
++    }
++
++    fun onRecordAudioPermissionStateObserved(granted: Boolean) {
++        _uiState.update { it.copy(hasRecordAudioPermission = granted) }
++    }
++
++    fun onAppResumed() {
++        _uiState.update { it.copy(isAppResumed = true) }
++    }
++
++    fun onAppPaused() {
++        _uiState.update { it.copy(isAppResumed = false) }
++    }
++
++    fun onAppStopped() {
++        val state = _uiState.value.recordingState
++        if (state is RecordingState.Idle || state is RecordingState.Finalizing) {
++            return
++        }
++        scope.launch {
++            requestStopRecording(showSavedMessage = false, force = true)
++        }
++    }
++
++    fun onMaximumWindowBoundsChanged(bounds: Rect) {
++        val previous = maximumWindowBounds
++        maximumWindowBounds = Rect(bounds)
++        val sizeChanged = previous.width() > 0 &&
++            previous.height() > 0 &&
++            (previous.width() != bounds.width() || previous.height() != bounds.height())
++        if (sizeChanged && _uiState.value.recordingState is RecordingState.Active) {
++            scope.launch {
++                requestStopRecording(showSavedMessage = false, force = true)
++                emitSnackbar("Recording stopped due to window size change.")
++            }
++        }
++    }
++
++    fun onRecordClick() {
++        val state = _uiState.value
++        if (!requestRecordingUseCase(state.recordingState) || !state.canRecord) {
++            return
++        }
++        if (!state.hasRecordAudioPermission) {
++            pendingStartAfterPermission = true
++            scope.launch {
++                _sideEffects.emit(SharedRecordingSideEffect.RequestRecordAudioPermission)
++            }
++            return
++        }
++        pendingStartAfterPermission = false
++        emitMediaProjectionConsentRequest()
++    }
++
++    fun onRecordAudioPermissionResult(granted: Boolean) {
++        onRecordAudioPermissionStateObserved(granted)
++        val shouldContinue = pendingStartAfterPermission
++        pendingStartAfterPermission = false
++        if (!shouldContinue) {
++            return
++        }
++
++        if (granted) {
++            val state = _uiState.value
++            if (state.recordingState !is RecordingState.Idle) {
++                return
++            }
++            emitMediaProjectionConsentRequest()
++        } else {
++            scope.launch {
++                emitSnackbar(AppError.MicrophonePermissionDenied().message)
++            }
++        }
++    }
++
++    fun onMediaProjectionConsentResult(resultCode: Int, data: Intent?) {
++        if (resultCode != Activity.RESULT_OK || data == null) {
++            scope.launch {
++                emitSnackbar(AppError.MediaProjectionDenied().message)
++            }
++            return
++        }
++
++        scope.launch {
++            startRecordingInternal(resultCode, data)
++        }
++    }
++
++    fun onStopRecordClick(showSavedMessage: Boolean = true) {
++        scope.launch {
++            requestStopRecording(showSavedMessage = showSavedMessage)
++        }
++    }
++
++    fun onDownloadRecordingClick() {
++        val state = _uiState.value
++        val artifact = state.lastCompletedRecording ?: return
++        if (!state.canDownloadRecording) {
++            return
++        }
++        scope.launch {
++            _sideEffects.emit(
++                SharedRecordingSideEffect.LaunchDownloadDestinationPicker(
++                    suggestedFileName = artifact.displayName
++                )
++            )
++        }
++    }
++
++    fun onDownloadDestinationSelected(destinationUri: Uri?) {
++        val uri = destinationUri ?: return
++        val state = _uiState.value
++        val artifact = state.lastCompletedRecording ?: return
++        if (state.recordingState !is RecordingState.Idle) {
++            return
++        }
++
++        scope.launch {
++            when (
++                val result = downloadRecordingUseCase(
++                    sourceUri = artifact.sourceUri,
++                    destinationUri = uri
++                )
++            ) {
++                is AppResult.Success -> emitSnackbar("Recording exported")
++                is AppResult.Failure -> emitSnackbar(result.error.message)
++            }
++        }
++    }
++
++    fun clearTransientMessage() {
++        _uiState.update { it.copy(transientMessage = null) }
++    }
++
++    fun release() {
++        recordingController.onProjectionStopped = null
++        runBlocking {
++            requestStopRecording(showSavedMessage = false, force = true)
++        }
++        recordingController.release()
++        scope.coroutineContext.cancel()
++    }
++
++    private suspend fun startRecordingInternal(
++        resultCode: Int,
++        data: Intent
++    ) = transitionMutex.withLock {
++        val state = _uiState.value
++        if (state.recordingState !is RecordingState.Idle) {
++            return@withLock
++        }
++
++        _uiState.update { it.copy(recordingState = RecordingState.Preparing) }
++        val result = startRecordingUseCase(
++            consentResultCode = resultCode,
++            consentData = data,
++            maximumWindowBounds = maximumWindowBounds
++        )
++        when (result) {
++            is AppResult.Success -> {
++                _uiState.update {
++                    it.copy(recordingState = RecordingState.Active(System.currentTimeMillis()))
++                }
++                if (pendingStopAfterPreparing) {
++                    pendingStopAfterPreparing = false
++                    stopRecordingLocked(showSavedMessage = false, force = true)
++                }
++            }
++
++            is AppResult.Failure -> {
++                pendingStopAfterPreparing = false
++                _uiState.update { it.copy(recordingState = RecordingState.Idle) }
++                emitSnackbar(result.error.message)
++            }
++        }
++    }
++
++    private suspend fun requestStopRecording(
++        showSavedMessage: Boolean,
++        force: Boolean = false
++    ) = transitionMutex.withLock {
++        stopRecordingLocked(showSavedMessage = showSavedMessage, force = force)
++    }
++
++    private suspend fun stopRecordingLocked(
++        showSavedMessage: Boolean,
++        force: Boolean
++    ) {
++        val state = _uiState.value.recordingState
++        if (!force && state is RecordingState.Idle) {
++            return
++        }
++        if (state is RecordingState.Finalizing) {
++            return
++        }
++        if (state is RecordingState.Preparing) {
++            pendingStopAfterPreparing = true
++            return
++        }
++
++        _uiState.update { it.copy(recordingState = RecordingState.Finalizing) }
++        when (val result = stopRecordingUseCase()) {
++            is AppResult.Success -> {
++                _uiState.update {
++                    it.copy(
++                        recordingState = RecordingState.Idle,
++                        lastCompletedRecording = result.value ?: it.lastCompletedRecording
++                    )
++                }
++                if (showSavedMessage && result.value != null) {
++                    emitSnackbar("Recording saved")
++                }
++            }
++
++            is AppResult.Failure -> {
++                _uiState.update { it.copy(recordingState = RecordingState.Idle) }
++                emitSnackbar(result.error.message)
++            }
++        }
++    }
++
++    private suspend fun emitSnackbar(message: String) {
++        _uiState.update { it.copy(transientMessage = message) }
++        _sideEffects.emit(SharedRecordingSideEffect.ShowSnackbar(message))
++    }
++
++    private fun emitMediaProjectionConsentRequest() {
++        scope.launch {
++            when (val consentIntent = recordingController.createConsentIntent()) {
++                is AppResult.Success -> {
++                    _sideEffects.emit(
++                        SharedRecordingSideEffect.RequestMediaProjectionConsent(consentIntent.value)
++                    )
++                }
++
++                is AppResult.Failure -> emitSnackbar(consentIntent.error.message)
++            }
++        }
++    }
++
++    private companion object {
++        private const val DEFAULT_CAPTURE_WIDTH = 1080
++        private const val DEFAULT_CAPTURE_HEIGHT = 1920
++    }
++}
+diff --git a/src/test/kotlin/com/example/arspatialpinning/platform/file/UriStreamOpenAttemptTest.kt b/src/test/kotlin/com/example/arspatialpinning/platform/file/UriStreamOpenAttemptTest.kt
+new file mode 100644
+index 0000000..726616e
+--- /dev/null
++++ b/src/test/kotlin/com/example/arspatialpinning/platform/file/UriStreamOpenAttemptTest.kt
+@@ -0,0 +1,108 @@
++package com.example.arspatialpinning.platform.file
++
++import com.example.arspatialpinning.common.AppResult
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.ByteArrayInputStream
++import kotlin.test.assertEquals
++
++class UriStreamOpenAttemptTest {
++
++    @Test
++    fun `uses primary stream when available`() {
++        val primaryStream = ByteArrayInputStream(byteArrayOf(1, 2, 3))
++
++        val result = UriStreamOpenAttempt(
++            primary = { primaryStream },
++            secondary = { ByteArrayInputStream(byteArrayOf(4, 5, 6)) },
++            tertiary = { ByteArrayInputStream(byteArrayOf(7, 8, 9)) },
++            quaternary = { ByteArrayInputStream(byteArrayOf(10, 11, 12)) }
++        ).open()
++
++        assertTrue(result is AppResult.Success)
++        assertSame(primaryStream, (result as AppResult.Success).value)
++    }
++
++    @Test
++    fun `falls back to secondary when primary returns null`() {
++        val secondaryStream = ByteArrayInputStream(byteArrayOf(4, 5, 6))
++
++        val result = UriStreamOpenAttempt(
++            primary = { null },
++            secondary = { secondaryStream },
++            tertiary = { ByteArrayInputStream(byteArrayOf(7, 8, 9)) },
++            quaternary = { ByteArrayInputStream(byteArrayOf(10, 11, 12)) }
++        ).open()
++
++        assertTrue(result is AppResult.Success)
++        assertSame(secondaryStream, (result as AppResult.Success).value)
++    }
++
++    @Test
++    fun `falls back to tertiary when previous attempts throw`() {
++        val tertiaryStream = ByteArrayInputStream(byteArrayOf(7, 8, 9))
++        val failures = mutableListOf<String>()
++
++        val result = UriStreamOpenAttempt(
++            primary = { throw IllegalStateException("primary") },
++            secondary = { throw IllegalArgumentException("secondary") },
++            tertiary = { tertiaryStream },
++            quaternary = { ByteArrayInputStream(byteArrayOf(10, 11, 12)) },
++            onFailure = { source, _ -> failures += source }
++        ).open()
++
++        assertTrue(result is AppResult.Success)
++        assertSame(tertiaryStream, (result as AppResult.Success).value)
++        kotlin.test.assertEquals(listOf("openInputStream", "openAssetFileDescriptor"), failures)
++    }
++
++    @Test
++    fun `returns null when all attempts fail`() {
++        val result = UriStreamOpenAttempt(
++            primary = { null },
++            secondary = { throw IllegalStateException("secondary") },
++            tertiary = { null },
++            quaternary = { null }
++        ).open()
++
++        assertTrue(result is AppResult.Failure)
++    }
++
++    @Test
++    fun `falls back to typed stream when other attempts fail`() {
++        val typedStream = ByteArrayInputStream(byteArrayOf(10, 11, 12))
++
++        val result = UriStreamOpenAttempt(
++            primary = { null },
++            secondary = { null },
++            tertiary = { null },
++            quaternary = { typedStream }
++        ).open()
++
++        assertTrue(result is AppResult.Success)
++        assertSame(typedStream, (result as AppResult.Success).value)
++    }
++
++    @Test
++    fun `typed mime candidates include static fallbacks even when provider stream types missing`() {
++        val candidates = typedMimeCandidates(streamTypes = null)
++
++        assertEquals(
++            listOf("image/png", "image/jpeg", "image/jpg", "image/*", "*/*"),
++            candidates
++        )
++    }
++
++    @Test
++    fun `typed mime candidates prioritize preferred provider image types and deduplicate`() {
++        val candidates = typedMimeCandidates(
++            streamTypes = arrayOf("text/plain", "image/jpeg", "image/png", "image/jpeg")
++        )
++
++        assertEquals(
++            listOf("image/jpeg", "image/png", "text/plain", "image/jpg", "image/*", "*/*"),
++            candidates
++        )
++    }
++}
+diff --git a/src/test/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReaderTest.kt b/src/test/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReaderTest.kt
+new file mode 100644
+index 0000000..0255185
+--- /dev/null
++++ b/src/test/kotlin/com/example/arspatialpinning/platform/file/AndroidImageUriReaderTest.kt
+@@ -0,0 +1,105 @@
++package com.example.arspatialpinning.platform.file
++
++import android.app.Application
++import android.graphics.Bitmap
++import android.net.Uri
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.domain.model.ImageFormat
++import com.example.arspatialpinning.domain.model.SelectedImage
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++import java.io.ByteArrayInputStream
++import java.io.ByteArrayOutputStream
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33])
++class AndroidImageUriReaderTest {
++
++    @Test
++    fun `readMetadata decodes bounds and returns metadata-only selection`() {
++        val app = RuntimeEnvironment.getApplication() as Application
++        val pngBytes = createPngBytes(width = 20, height = 10)
++        val reader = AndroidImageUriReader(
++            contentResolver = app.contentResolver,
++            uriStreamOpener = object : UriStreamOpener {
++                override fun openForRead(uri: Uri) = AppResult.Success(ByteArrayInputStream(pngBytes))
++            }
++        )
++
++        val result = reader.readMetadata(
++            uri = Uri.parse("content://test/image.png"),
++            validation = ImageValidationResult(
++                format = ImageFormat.Png,
++                mimeType = "image/png",
++                displayName = "image.png"
++            ),
++            selectionRevision = 9L
++        )
++
++        assertTrue(result is AppResult.Success)
++        val image = (result as AppResult.Success).value
++        assertEquals(20, image.widthPx)
++        assertEquals(10, image.heightPx)
++        assertEquals("image/png", image.mimeType)
++        assertEquals(9L, image.selectionRevision)
++    }
++
++    @Test
++    fun `decodeBitmap rejects dimension-only metadata success`() {
++        val app = RuntimeEnvironment.getApplication() as Application
++        val reader = AndroidImageUriReader(app.contentResolver)
++        val selected = SelectedImage(
++            uri = Uri.parse("content://test/image.png"),
++            displayName = "image.png",
++            mimeType = "image/png",
++            widthPx = 0,
++            heightPx = 0,
++            format = ImageFormat.Png,
++            selectionRevision = 1L
++        )
++
++        val result = reader.decodeBitmap(selected)
++
++        assertTrue(result is AppResult.Failure)
++        assertTrue((result as AppResult.Failure).error is AppError.DimensionOnlySuccessAttempted)
++    }
++
++    @Test
++    fun `readMetadata returns file-open failure when stream opening fails`() {
++        val app = RuntimeEnvironment.getApplication() as Application
++        val reader = AndroidImageUriReader(
++            contentResolver = app.contentResolver,
++            uriStreamOpener = object : UriStreamOpener {
++                override fun openForRead(uri: Uri) = AppResult.Failure(AppError.FileOpenFailed())
++            }
++        )
++
++        val result = reader.readMetadata(
++            uri = Uri.parse("content://test/image.png"),
++            validation = ImageValidationResult(
++                format = ImageFormat.Png,
++                mimeType = "image/png",
++                displayName = "image.png"
++            ),
++            selectionRevision = 10L
++        )
++
++        assertTrue(result is AppResult.Failure)
++        assertTrue((result as AppResult.Failure).error is AppError.FileOpenFailed)
++    }
++
++    private fun createPngBytes(width: Int, height: Int): ByteArray {
++        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
++        return ByteArrayOutputStream().use { output ->
++            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
++            bitmap.recycle()
++            output.toByteArray()
++        }
++    }
++}
+diff --git a/src/test/kotlin/com/example/arspatialpinning/platform/media/RecordingExporterTest.kt b/src/test/kotlin/com/example/arspatialpinning/platform/media/RecordingExporterTest.kt
+new file mode 100644
+index 0000000..e9a632f
+--- /dev/null
++++ b/src/test/kotlin/com/example/arspatialpinning/platform/media/RecordingExporterTest.kt
+@@ -0,0 +1,75 @@
++package com.example.arspatialpinning.platform.media
++
++import android.app.Application
++import android.net.Uri
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.common.DefaultDispatcherProvider
++import com.example.arspatialpinning.common.Logger
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++import java.io.File
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33])
++class RecordingExporterTest {
++
++    @Test
++    fun `exportRecording copies validated source bytes into destination`() = runBlocking {
++        val app = RuntimeEnvironment.getApplication() as Application
++        val sourceFile = File(app.cacheDir, "source_recording.mp4")
++        val destinationFile = File(app.cacheDir, "destination_recording.mp4")
++        sourceFile.writeBytes(byteArrayOf(1, 3, 5, 7, 9))
++        if (destinationFile.exists()) {
++            destinationFile.delete()
++        }
++
++        val exporter = ContentResolverRecordingExporter(
++            contentResolver = app.contentResolver,
++            dispatchers = DefaultDispatcherProvider,
++            logger = NoOpLogger
++        )
++
++        val result = exporter.exportRecording(
++            sourceUri = Uri.fromFile(sourceFile),
++            destinationUri = Uri.fromFile(destinationFile)
++        )
++
++        assertTrue(result is AppResult.Success)
++        assertArrayEquals(sourceFile.readBytes(), destinationFile.readBytes())
++    }
++
++    @Test
++    fun `exportRecording returns failure when source cannot be opened`() = runBlocking {
++        val app = RuntimeEnvironment.getApplication() as Application
++        val destinationFile = File(app.cacheDir, "missing_destination.mp4")
++        if (destinationFile.exists()) {
++            destinationFile.delete()
++        }
++
++        val exporter = ContentResolverRecordingExporter(
++            contentResolver = app.contentResolver,
++            dispatchers = DefaultDispatcherProvider,
++            logger = NoOpLogger
++        )
++
++        val result = exporter.exportRecording(
++            sourceUri = Uri.fromFile(File(app.cacheDir, "does_not_exist.mp4")),
++            destinationUri = Uri.fromFile(destinationFile)
++        )
++
++        assertTrue(result is AppResult.Failure)
++        assertTrue((result as AppResult.Failure).error is AppError.DownloadExportFailed)
++    }
++
++    private data object NoOpLogger : Logger {
++        override fun d(tag: String, message: String) = Unit
++        override fun e(tag: String, message: String, throwable: Throwable?) = Unit
++    }
++}
+diff --git a/src/test/kotlin/com/example/arspatialpinning/platform/media/SharedRecordingStateHolderTest.kt b/src/test/kotlin/com/example/arspatialpinning/platform/media/SharedRecordingStateHolderTest.kt
+new file mode 100644
+index 0000000..133bc2d
+--- /dev/null
++++ b/src/test/kotlin/com/example/arspatialpinning/platform/media/SharedRecordingStateHolderTest.kt
+@@ -0,0 +1,275 @@
++package com.example.arspatialpinning.platform.media
++
++import android.app.Activity
++import android.content.Intent
++import android.graphics.Rect
++import android.net.Uri
++import app.cash.turbine.test
++import com.example.arspatialpinning.common.AppError
++import com.example.arspatialpinning.common.AppResult
++import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
++import com.example.arspatialpinning.domain.usecase.DownloadRecordingUseCase
++import com.example.arspatialpinning.domain.usecase.RequestRecordingUseCase
++import com.example.arspatialpinning.domain.usecase.StartRecordingUseCase
++import com.example.arspatialpinning.domain.usecase.StopRecordingUseCase
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.StandardTestDispatcher
++import kotlinx.coroutines.test.TestDispatcher
++import kotlinx.coroutines.test.advanceUntilIdle
++import kotlinx.coroutines.test.resetMain
++import kotlinx.coroutines.test.runTest
++import kotlinx.coroutines.test.setMain
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TestWatcher
++import org.junit.runner.Description
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalCoroutinesApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33])
++class SharedRecordingStateHolderTest {
++
++    @get:Rule
++    val mainDispatcherRule = MainDispatcherRule()
++
++    @Test
++    fun recordClick_withoutMicrophonePermission_requestsPermission() = runTest {
++        val holder = createHolder()
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(false)
++
++        holder.sideEffects.test {
++            holder.onRecordClick()
++            assertEquals(SharedRecordingSideEffect.RequestRecordAudioPermission, awaitItem())
++            cancelAndIgnoreRemainingEvents()
++        }
++
++        holder.release()
++    }
++
++    @Test
++    fun recordClick_whenConsentIntentCreationFails_emitsMappedFailure() = runTest {
++        val controller = FakeRecordingController().apply {
++            consentIntentResult = AppResult.Failure(AppError.MediaProjectionConsentIntentFailed())
++        }
++        val holder = createHolder(recordingController = controller)
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(true)
++
++        holder.sideEffects.test {
++            holder.onRecordClick()
++            assertEquals(
++                SharedRecordingSideEffect.ShowSnackbar(AppError.MediaProjectionConsentIntentFailed().message),
++                awaitItem()
++            )
++            cancelAndIgnoreRemainingEvents()
++        }
++
++        holder.release()
++    }
++
++    @Test
++    fun validatedStop_updatesLastCompletedRecording_onlyAfterStopSuccess() = runTest {
++        val artifact = RecordedVideoArtifact(
++            sourceUri = Uri.parse("content://recordings/validated.mp4"),
++            displayName = "validated.mp4"
++        )
++        val recordingController = FakeRecordingController().apply {
++            stopResult = AppResult.Success(artifact)
++        }
++        val holder = createHolder(recordingController = recordingController)
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(true)
++
++        holder.sideEffects.test {
++            holder.onRecordClick()
++            val consent = awaitItem()
++            assertTrue(consent is SharedRecordingSideEffect.RequestMediaProjectionConsent)
++            cancelAndIgnoreRemainingEvents()
++        }
++
++        holder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
++        advanceUntilIdle()
++        assertTrue(holder.uiState.value.recordingState is com.example.arspatialpinning.domain.model.RecordingState.Active)
++        assertNull(holder.uiState.value.lastCompletedRecording)
++
++        holder.onStopRecordClick(showSavedMessage = false)
++        advanceUntilIdle()
++
++        assertTrue(holder.uiState.value.recordingState is com.example.arspatialpinning.domain.model.RecordingState.Idle)
++        assertEquals(artifact, holder.uiState.value.lastCompletedRecording)
++        holder.release()
++    }
++
++    @Test
++    fun repeatedStopRequests_areIdempotent_afterFinalizationStarts() = runTest {
++        val stopGate = CompletableDeferred<Unit>()
++        val recordingController = FakeRecordingController().apply {
++            stopCompletion = stopGate
++            stopResult = AppResult.Success(null)
++        }
++        val holder = createHolder(recordingController = recordingController)
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(true)
++        holder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
++        advanceUntilIdle()
++
++        holder.onStopRecordClick(showSavedMessage = false)
++        holder.onStopRecordClick(showSavedMessage = false)
++        advanceUntilIdle()
++
++        assertEquals(1, recordingController.stopCalls)
++        stopGate.complete(Unit)
++        advanceUntilIdle()
++        holder.release()
++    }
++
++    @Test
++    fun stopRequestedDuringPreparing_isAppliedAfterStart_andKeepsDownloadableArtifact() = runTest {
++        val startGate = CompletableDeferred<Unit>()
++        val artifact = RecordedVideoArtifact(
++            sourceUri = Uri.parse("content://recordings/queued-stop.mp4"),
++            displayName = "queued-stop.mp4"
++        )
++        val recordingController = FakeRecordingController().apply {
++            startCompletion = startGate
++            stopResult = AppResult.Success(artifact)
++        }
++        val holder = createHolder(recordingController = recordingController)
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(true)
++
++        holder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
++        advanceUntilIdle()
++        assertTrue(holder.uiState.value.recordingState is com.example.arspatialpinning.domain.model.RecordingState.Preparing)
++
++        holder.onStopRecordClick(showSavedMessage = false)
++        advanceUntilIdle()
++        assertTrue(holder.uiState.value.recordingState is com.example.arspatialpinning.domain.model.RecordingState.Preparing)
++        assertEquals(0, recordingController.stopCalls)
++
++        startGate.complete(Unit)
++        advanceUntilIdle()
++
++        assertTrue(holder.uiState.value.recordingState is com.example.arspatialpinning.domain.model.RecordingState.Idle)
++        assertEquals(1, recordingController.stopCalls)
++        assertEquals(artifact, holder.uiState.value.lastCompletedRecording)
++        holder.release()
++    }
++
++    @Test
++    fun exportFailure_keepsLastCompletedRecording_availableForRetry() = runTest {
++        val artifact = RecordedVideoArtifact(
++            sourceUri = Uri.parse("content://recordings/validated.mp4"),
++            displayName = "validated.mp4"
++        )
++        val recordingController = FakeRecordingController().apply {
++            stopResult = AppResult.Success(artifact)
++        }
++        val exporter = FakeRecordingExporter().apply {
++            result = AppResult.Failure(AppError.DownloadExportFailed())
++        }
++        val holder = createHolder(recordingController = recordingController, recordingExporter = exporter)
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(true)
++        holder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
++        advanceUntilIdle()
++        holder.onStopRecordClick(showSavedMessage = false)
++        advanceUntilIdle()
++
++        holder.onDownloadDestinationSelected(Uri.parse("content://downloads/target.mp4"))
++        advanceUntilIdle()
++
++        assertEquals(artifact, holder.uiState.value.lastCompletedRecording)
++        holder.release()
++    }
++
++    @Test
++    fun appStopped_whileRecording_stopsDefensively() = runTest {
++        val recordingController = FakeRecordingController().apply {
++            stopResult = AppResult.Success(null)
++        }
++        val holder = createHolder(recordingController = recordingController)
++        holder.onAppResumed()
++        holder.onRecordAudioPermissionStateObserved(true)
++        holder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
++        advanceUntilIdle()
++
++        holder.onAppStopped()
++        advanceUntilIdle()
++
++        assertEquals(1, recordingController.stopCalls)
++        assertTrue(holder.uiState.value.recordingState is com.example.arspatialpinning.domain.model.RecordingState.Idle)
++        holder.release()
++    }
++
++    private fun createHolder(
++        recordingController: FakeRecordingController = FakeRecordingController(),
++        recordingExporter: FakeRecordingExporter = FakeRecordingExporter()
++    ): SharedRecordingStateHolder {
++        return SharedRecordingStateHolder(
++            requestRecordingUseCase = RequestRecordingUseCase(),
++            startRecordingUseCase = StartRecordingUseCase(recordingController),
++            stopRecordingUseCase = StopRecordingUseCase(recordingController),
++            downloadRecordingUseCase = DownloadRecordingUseCase(recordingExporter),
++            recordingController = recordingController
++        )
++    }
++
++    private class FakeRecordingController : RecordingController {
++        var stopCalls: Int = 0
++        var startCompletion: CompletableDeferred<Unit>? = null
++        var stopCompletion: CompletableDeferred<Unit>? = null
++        var startResult: AppResult<Unit> = AppResult.Success(Unit)
++        var stopResult: AppResult<RecordedVideoArtifact?> = AppResult.Success(null)
++        var consentIntentResult: AppResult<Intent> = AppResult.Success(Intent("projection-consent"))
++        override var onProjectionStopped: (() -> Unit)? = null
++
++        override fun createConsentIntent(): AppResult<Intent> = consentIntentResult
++
++        override suspend fun startRecording(
++            consentResultCode: Int,
++            consentData: Intent,
++            maximumWindowBounds: Rect
++        ): AppResult<Unit> {
++            startCompletion?.await()
++            return startResult
++        }
++
++        override suspend fun stopRecording(): AppResult<RecordedVideoArtifact?> {
++            stopCalls += 1
++            stopCompletion?.await()
++            return stopResult
++        }
++
++        override fun release() = Unit
++    }
++
++    private class FakeRecordingExporter : RecordingExporter {
++        var result: AppResult<Unit> = AppResult.Success(Unit)
++
++        override suspend fun exportRecording(sourceUri: Uri, destinationUri: Uri): AppResult<Unit> {
++            return result
++        }
++    }
++
++    class MainDispatcherRule(
++        private val dispatcher: TestDispatcher = StandardTestDispatcher()
++    ) : TestWatcher() {
++        override fun starting(description: Description) {
++            Dispatchers.setMain(dispatcher)
++        }
++
++        override fun finished(description: Description) {
++            Dispatchers.resetMain()
++        }
++    }
++}
