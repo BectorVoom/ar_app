@@ -21,6 +21,7 @@ import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.domain.model.PlacementTransform
 import com.example.arspatialpinning.domain.model.PreparedRenderAsset
 import com.example.arspatialpinning.domain.model.PreviewRenderState
+import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
 import com.example.arspatialpinning.domain.model.RecordingState
 import com.example.arspatialpinning.domain.model.RenderAssetState
 import com.example.arspatialpinning.domain.model.SelectedImage
@@ -169,8 +170,8 @@ class ArControlsInstrumentedTest {
         composeRule.onNodeWithText("Cancel Reposition").performClick()
 
         composeRule.runOnIdle {
-            assertTrue(events.contains(ArUiEvent.ConfirmRepositionClicked))
-            assertTrue(events.contains(ArUiEvent.CancelRepositionClicked))
+            assertTrue(events.contains(ArUiEvent.OnConfirmRepositionClick))
+            assertTrue(events.contains(ArUiEvent.OnCancelRepositionClick))
         }
     }
 
@@ -217,8 +218,35 @@ class ArControlsInstrumentedTest {
         composeRule.onNodeWithText("Delete").performClick()
 
         composeRule.runOnIdle {
-            assertTrue(events.contains(ArUiEvent.DeleteClicked))
+            assertTrue(events.contains(ArUiEvent.OnDeleteClick))
         }
+    }
+
+    @Test
+    fun downloadButton_disabledBeforeValidatedRecording_andEnabledAfterValidation() {
+        var uiState by mutableStateOf(ArUiState(recordingState = RecordingState.Idle))
+
+        composeRule.setContent {
+            MaterialTheme {
+                ArControls(
+                    uiState = uiState,
+                    onEvent = {}
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("Download Recording").assertIsDisplayed().assertIsNotEnabled()
+
+        composeRule.runOnIdle {
+            uiState = uiState.copy(
+                lastCompletedRecording = RecordedVideoArtifact(
+                    sourceUri = Uri.parse("content://recordings/validated.mp4"),
+                    displayName = "validated.mp4"
+                )
+            )
+        }
+
+        composeRule.onNodeWithText("Download Recording").assertIsEnabled()
     }
 
     private fun createSelectedImage(revision: Long): SelectedImage {

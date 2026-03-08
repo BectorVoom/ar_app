@@ -7,6 +7,7 @@ import android.util.Log
 import com.example.arspatialpinning.common.AppError
 import com.example.arspatialpinning.common.AppResult
 import com.example.arspatialpinning.domain.model.ImageFormat
+import java.io.IOException
 
 data class ImageValidationResult(
     val format: ImageFormat,
@@ -19,20 +20,36 @@ class ImageValidator(
     private val uriStreamOpener: UriStreamOpener = ContentResolverUriStreamOpener(contentResolver)
 ) {
     fun validate(uri: Uri): AppResult<ImageValidationResult> {
-        val mimeType = runCatching { contentResolver.getType(uri) }.getOrNull()
+        val mimeType = readMimeType(uri)
         val displayName = readDisplayName(uri)
         val inspection: HeaderInspection
 
-        try {
-            val stream = uriStreamOpener.openForRead(uri)
-            if (stream == null) {
-                Log.e(TAG, "Unable to inspect selected image because stream open returned null. uri=$uri mime=$mimeType displayName=$displayName")
-                return AppResult.Failure(AppError.FileOpenFailed())
+        when (val streamResult = uriStreamOpener.openForRead(uri)) {
+            is AppResult.Failure -> {
+                Log.e(
+                    TAG,
+                    "Unable to inspect selected image because stream open failed. uri=$uri mime=$mimeType displayName=$displayName"
+                )
+                return streamResult
             }
-            inspection = stream.use(::inspectHeaderAndTail)
-        } catch (error: Throwable) {
-            Log.e(TAG, "Failed to inspect selected image uri=$uri", error)
-            return AppResult.Failure(AppError.FileOpenFailed())
+
+            is AppResult.Success -> {
+                try {
+                    inspection = streamResult.value.use(::inspectHeaderAndTail)
+                } catch (error: IOException) {
+                    Log.e(TAG, "Failed to inspect selected image uri=$uri", error)
+                    return AppResult.Failure(AppError.FileOpenFailed())
+                } catch (error: SecurityException) {
+                    Log.e(TAG, "Missing read permission while inspecting selected image uri=$uri", error)
+                    return AppResult.Failure(AppError.FileOpenFailed())
+                } catch (error: IllegalArgumentException) {
+                    Log.e(TAG, "Invalid image stream while inspecting uri=$uri", error)
+                    return AppResult.Failure(AppError.InvalidImage())
+                } catch (error: IllegalStateException) {
+                    Log.e(TAG, "Image stream inspection failed for uri=$uri", error)
+                    return AppResult.Failure(AppError.InvalidImage())
+                }
+            }
         }
 
         val format = ImageValidationRules.resolveFormat(
@@ -54,6 +71,21 @@ class ImageValidator(
                 displayName = displayName
             )
         )
+    }
+
+    private fun readMimeType(uri: Uri): String? {
+        return try {
+            contentResolver.getType(uri)
+        } catch (error: SecurityException) {
+            Log.d(TAG, "Unable to resolve MIME type due to missing permission for uri=$uri")
+            null
+        } catch (error: IllegalArgumentException) {
+            Log.d(TAG, "Unable to resolve MIME type due to invalid uri=$uri")
+            null
+        } catch (error: IllegalStateException) {
+            Log.d(TAG, "Unable to resolve MIME type due to provider state for uri=$uri")
+            null
+        }
     }
 
     private fun inspectHeaderAndTail(input: java.io.InputStream): HeaderInspection {
@@ -93,7 +125,7 @@ class ImageValidator(
     }
 
     private fun readDisplayName(uri: Uri): String? {
-        val fromMetadata = runCatching {
+        val fromMetadata = try {
             contentResolver.query(
                 uri,
                 arrayOf(OpenableColumns.DISPLAY_NAME),
@@ -111,7 +143,16 @@ class ImageValidator(
                     cursor.getString(index)
                 }
             }
-        }.getOrNull()
+        } catch (error: SecurityException) {
+            Log.d(TAG, "Display-name query blocked by permission for uri=$uri")
+            null
+        } catch (error: IllegalArgumentException) {
+            Log.d(TAG, "Display-name query failed due to invalid uri=$uri")
+            null
+        } catch (error: IllegalStateException) {
+            Log.d(TAG, "Display-name query failed due to provider state for uri=$uri")
+            null
+        }
         return fromMetadata ?: uri.lastPathSegment
     }
 

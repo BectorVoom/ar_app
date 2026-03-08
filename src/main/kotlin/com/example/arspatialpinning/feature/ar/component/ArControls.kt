@@ -34,7 +34,7 @@ fun ArControls(
         ) {
             Button(
                 enabled = uiState.canSelectImage,
-                onClick = { onEvent(ArUiEvent.SelectImageClicked) },
+                onClick = { onEvent(ArUiEvent.OnSelectImageClick) },
                 modifier = Modifier.weight(1f)
             ) {
                 Text(text = "Select Image")
@@ -43,7 +43,7 @@ fun ArControls(
             if (uiState.placementMode == PlacementMode.WaitingForPlacement) {
                 Button(
                     enabled = uiState.canPlace,
-                    onClick = { onEvent(ArUiEvent.PlaceClicked) },
+                    onClick = { onEvent(ArUiEvent.OnPlaceClick) },
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(text = "Place")
@@ -51,7 +51,7 @@ fun ArControls(
             } else if (uiState.placementMode == PlacementMode.Repositioning) {
                 Button(
                     enabled = uiState.canConfirmReposition,
-                    onClick = { onEvent(ArUiEvent.ConfirmRepositionClicked) },
+                    onClick = { onEvent(ArUiEvent.OnConfirmRepositionClick) },
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(text = "Confirm Reposition")
@@ -59,7 +59,7 @@ fun ArControls(
             } else {
                 Button(
                     enabled = uiState.canReposition,
-                    onClick = { onEvent(ArUiEvent.RepositionClicked) },
+                    onClick = { onEvent(ArUiEvent.OnRepositionClick) },
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(text = "Reposition")
@@ -73,7 +73,7 @@ fun ArControls(
         ) {
             Button(
                 enabled = uiState.canDelete,
-                onClick = { onEvent(ArUiEvent.DeleteClicked) },
+                onClick = { onEvent(ArUiEvent.OnDeleteClick) },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.errorContainer,
                     contentColor = MaterialTheme.colorScheme.onErrorContainer
@@ -91,14 +91,27 @@ fun ArControls(
                 enabled = uiState.canRecord || isRecording,
                 onClick = {
                     if (isRecording) {
-                        onEvent(ArUiEvent.StopRecordingClicked)
+                        onEvent(ArUiEvent.OnStopRecordClick)
                     } else {
-                        onEvent(ArUiEvent.RecordClicked)
+                        onEvent(ArUiEvent.OnRecordClick)
                     }
                 },
                 modifier = Modifier.weight(1f)
             ) {
                 Text(text = if (isRecording) "Stop Recording" else "Record")
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                enabled = uiState.canDownloadRecording,
+                onClick = { onEvent(ArUiEvent.OnDownloadRecordingClick) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(text = "Download Recording")
             }
         }
 
@@ -109,7 +122,7 @@ fun ArControls(
             ) {
                 Button(
                     enabled = uiState.canCancelReposition,
-                    onClick = { onEvent(ArUiEvent.CancelRepositionClicked) },
+                    onClick = { onEvent(ArUiEvent.OnCancelRepositionClick) },
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(text = "Cancel Reposition")

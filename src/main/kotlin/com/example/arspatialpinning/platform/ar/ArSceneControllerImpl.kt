@@ -29,6 +29,7 @@ import io.github.sceneview.math.Scale
 import io.github.sceneview.math.Size
 import io.github.sceneview.node.ImageNode
 import io.github.sceneview.node.Node
+import java.lang.reflect.InvocationTargetException
 import java.util.UUID
 import kotlin.math.atan2
 import kotlin.math.sqrt
@@ -115,67 +116,89 @@ class ArSceneControllerImpl(
             return AppResult.Failure(AppError.Unexpected("AR scene is not initialized."))
         }
 
-        return try {
-            invalidatePreparedRegistry()
+        invalidatePreparedRegistry()
 
-            val decodeResult = uriReadPermissionGuard.withReadPermission(selectedImage.uri) {
-                imageUriReader.decodeBitmap(selectedImage)
-            }
-            val decodedBitmap = when (decodeResult) {
-                is AppResult.Success -> decodeResult.value
-                is AppResult.Failure -> return decodeResult
-            }
-            if (decodedBitmap.width <= 0 || decodedBitmap.height <= 0) {
-                decodedBitmap.safeRecycle()
-                return AppResult.Failure(AppError.DimensionOnlySuccessAttempted())
-            }
+        val decodeResult = uriReadPermissionGuard.withReadPermission(selectedImage.uri) {
+            imageUriReader.decodeBitmap(selectedImage)
+        }
+        val decodedBitmap = when (decodeResult) {
+            is AppResult.Success -> decodeResult.value
+            is AppResult.Failure -> return decodeResult
+        }
+        if (decodedBitmap.width <= 0 || decodedBitmap.height <= 0) {
+            decodedBitmap.safeRecycle()
+            return AppResult.Failure(AppError.DimensionOnlySuccessAttempted())
+        }
 
-            val assetHandleId = UUID.randomUUID().toString()
-            val asset = PreparedRenderAsset(
-                assetHandleId = assetHandleId,
-                widthPx = decodedBitmap.width,
-                heightPx = decodedBitmap.height,
-                aspectRatio = decodedBitmap.width.toFloat() / decodedBitmap.height.toFloat(),
-                selectionRevision = selectedImage.selectionRevision
-            )
-            val previewNode = buildImageNode(
+        val assetHandleId = UUID.randomUUID().toString()
+        val asset = PreparedRenderAsset(
+            assetHandleId = assetHandleId,
+            widthPx = decodedBitmap.width,
+            heightPx = decodedBitmap.height,
+            aspectRatio = decodedBitmap.width.toFloat() / decodedBitmap.height.toFloat(),
+            selectionRevision = selectedImage.selectionRevision
+        )
+
+        val previewNode = try {
+            buildImageNode(
                 bitmap = decodedBitmap,
                 sceneMaterialLoader = sceneMaterialLoader,
                 aspectRatio = asset.aspectRatio
             ).apply {
                 isVisible = false
             }
-            sceneNodes += previewNode
-
-            val bundle = PreparedRenderBundle(
-                selectedImage = selectedImage,
-                preparedAsset = asset,
-                bitmap = decodedBitmap,
-                node = previewNode,
-                role = NodeRole.Preview
-            )
-            preparedBundleRegistry[assetHandleId] = bundle
-            activePreparedAsset = asset
-            placedAssetHandleId = null
-            placedState = null
-
-            debugStatusTracker.onPreparedAssetRegistered(assetHandleId)
-            debugStatusTracker.onPreviewNodePrepared(
-                assetHandleId = assetHandleId,
-                attached = isPreviewAttached(previewNode)
-            )
-
-            val registered = preparedBundleRegistry[assetHandleId] != null
-            if (!registered) {
-                return AppResult.Failure(AppError.MetadataOnlySuccessAttempted())
-            }
-
-            AppResult.Success(asset)
-        } catch (t: Throwable) {
-            logger.e(TAG, "Failed to prepare image render asset.", t)
-            invalidatePreparedRegistry()
-            AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
+        } catch (error: IllegalArgumentException) {
+            decodedBitmap.safeRecycle()
+            logger.e(TAG, "Failed to build preview node for selected image.", error)
+            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
+        } catch (error: IllegalStateException) {
+            decodedBitmap.safeRecycle()
+            logger.e(TAG, "Failed to build preview node for selected image.", error)
+            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
+        } catch (error: RuntimeException) {
+            decodedBitmap.safeRecycle()
+            logger.e(TAG, "Failed to build preview node for selected image.", error)
+            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
         }
+
+        try {
+            sceneNodes += previewNode
+        } catch (error: UnsupportedOperationException) {
+            previewNode.safeDestroy(logger)
+            decodedBitmap.safeRecycle()
+            logger.e(TAG, "Failed to attach preview node to scene.", error)
+            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
+        } catch (error: RuntimeException) {
+            previewNode.safeDestroy(logger)
+            decodedBitmap.safeRecycle()
+            logger.e(TAG, "Failed to attach preview node to scene.", error)
+            return AppResult.Failure(AppError.PreviewRenderCreationFailed("Failed to prepare selected image render asset."))
+        }
+
+        val bundle = PreparedRenderBundle(
+            selectedImage = selectedImage,
+            preparedAsset = asset,
+            bitmap = decodedBitmap,
+            node = previewNode,
+            role = NodeRole.Preview
+        )
+        preparedBundleRegistry[assetHandleId] = bundle
+        activePreparedAsset = asset
+        placedAssetHandleId = null
+        placedState = null
+
+        debugStatusTracker.onPreparedAssetRegistered(assetHandleId)
+        debugStatusTracker.onPreviewNodePrepared(
+            assetHandleId = assetHandleId,
+            attached = isPreviewAttached(previewNode)
+        )
+
+        val registered = preparedBundleRegistry[assetHandleId] != null
+        if (!registered) {
+            return AppResult.Failure(AppError.MetadataOnlySuccessAttempted())
+        }
+
+        return AppResult.Success(asset)
     }
 
     override fun processFrame(
@@ -296,18 +319,45 @@ class ArSceneControllerImpl(
             return AppResult.Failure(AppError.PreviewRenderCreationFailed("Prepared preview node is not attached."))
         }
 
-        return try {
-            val placement = computePlacement(stable)
-            val anchor = session.createAnchor(
+        val placement = computePlacement(stable)
+        val anchor = try {
+            session.createAnchor(
                 Pose.makeTranslation(
                     placement.translationX,
                     placement.translationY,
                     placement.translationZ
                 )
             )
-            val anchorNode = AnchorNode(sceneEngine, anchor)
-            val node = bundle.node
+        } catch (error: IllegalArgumentException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        }
 
+        val anchorNode = try {
+            AnchorNode(sceneEngine, anchor)
+        } catch (error: IllegalArgumentException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            safeDetachAnchor(anchor, logger)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            safeDetachAnchor(anchor, logger)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            safeDetachAnchor(anchor, logger)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        }
+
+        val node = bundle.node
+
+        try {
             deletePlacedImage()
 
             sceneNodes.remove(node)
@@ -320,28 +370,41 @@ class ArSceneControllerImpl(
 
             anchorNode.addChildNode(node)
             sceneNodes += anchorNode
-
-            bundle.role = NodeRole.Placed
-            placedAnchorNode = anchorNode
-            placedImageNode = node
-            placedAssetHandleId = preparedAsset.assetHandleId
-            placedState = PlacedImageState(
-                anchorId = anchor.hashCode().toString(),
-                widthMeters = DEFAULT_HEIGHT_METERS * preparedAsset.aspectRatio,
-                heightMeters = DEFAULT_HEIGHT_METERS,
-                transform = PlacementTransform(scale = 1f, rotationYDegrees = normalizeDegrees(placement.rotationYDegrees))
-            )
-
-            debugStatusTracker.onPlaced(
-                assetHandleId = preparedAsset.assetHandleId,
-                placedAttached = isPlacedAttached()
-            )
-
-            AppResult.Success(requireNotNull(placedState))
-        } catch (t: Throwable) {
-            logger.e(TAG, "Failed to place prepared image.", t)
-            AppResult.Failure(AppError.Unexpected("Failed to place image in AR scene."))
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            anchorNode.safeDestroy(logger)
+            safeDetachAnchor(anchor, logger)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        } catch (error: UnsupportedOperationException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            anchorNode.safeDestroy(logger)
+            safeDetachAnchor(anchor, logger)
+            return AppResult.Failure(AppError.ArPlacementFailed())
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to place prepared image.", error)
+            anchorNode.safeDestroy(logger)
+            safeDetachAnchor(anchor, logger)
+            return AppResult.Failure(AppError.ArPlacementFailed())
         }
+
+        bundle.role = NodeRole.Placed
+        placedAnchorNode = anchorNode
+        placedImageNode = node
+        placedAssetHandleId = preparedAsset.assetHandleId
+        val placed = PlacedImageState(
+            anchorId = anchor.hashCode().toString(),
+            widthMeters = DEFAULT_HEIGHT_METERS * preparedAsset.aspectRatio,
+            heightMeters = DEFAULT_HEIGHT_METERS,
+            transform = PlacementTransform(scale = 1f, rotationYDegrees = normalizeDegrees(placement.rotationYDegrees))
+        )
+        placedState = placed
+
+        debugStatusTracker.onPlaced(
+            assetHandleId = preparedAsset.assetHandleId,
+            placedAttached = isPlacedAttached()
+        )
+
+        return AppResult.Success(placed)
     }
 
     override fun enterRepositionMode() {
@@ -357,17 +420,42 @@ class ArSceneControllerImpl(
         val currentState = placedState ?: return AppResult.Failure(AppError.Unexpected("No placed state."))
         val handleId = placedAssetHandleId ?: return AppResult.Failure(AppError.StaleOrMissingPreparedAssetHandle())
 
-        return try {
-            val placement = computePlacement(stable)
-            val newAnchor = session.createAnchor(
+        val placement = computePlacement(stable)
+        val newAnchor = try {
+            session.createAnchor(
                 Pose.makeTranslation(
                     placement.translationX,
                     placement.translationY,
                     placement.translationZ
                 )
             )
-            val newAnchorNode = AnchorNode(sceneEngine, newAnchor)
+        } catch (error: IllegalArgumentException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        }
+        val newAnchorNode = try {
+            AnchorNode(sceneEngine, newAnchor)
+        } catch (error: IllegalArgumentException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            safeDetachAnchor(newAnchor, logger)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            safeDetachAnchor(newAnchor, logger)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            safeDetachAnchor(newAnchor, logger)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        }
 
+        try {
             oldAnchorNode.removeChildNode(node)
             sceneNodes.remove(oldAnchorNode)
             oldAnchorNode.detachAnchor()
@@ -380,16 +468,29 @@ class ArSceneControllerImpl(
 
             newAnchorNode.addChildNode(node)
             sceneNodes += newAnchorNode
-
-            placedAnchorNode = newAnchorNode
-            placedState = currentState.copy(anchorId = newAnchor.hashCode().toString())
-
-            debugStatusTracker.onPlaced(assetHandleId = handleId, placedAttached = isPlacedAttached())
-            AppResult.Success(requireNotNull(placedState))
-        } catch (t: Throwable) {
-            logger.e(TAG, "Failed to reposition image.", t)
-            AppResult.Failure(AppError.Unexpected("Failed to reposition image."))
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            newAnchorNode.safeDestroy(logger)
+            safeDetachAnchor(newAnchor, logger)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        } catch (error: UnsupportedOperationException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            newAnchorNode.safeDestroy(logger)
+            safeDetachAnchor(newAnchor, logger)
+            return AppResult.Failure(AppError.ArRepositionFailed())
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to reposition image.", error)
+            newAnchorNode.safeDestroy(logger)
+            safeDetachAnchor(newAnchor, logger)
+            return AppResult.Failure(AppError.ArRepositionFailed())
         }
+
+        placedAnchorNode = newAnchorNode
+        val placed = currentState.copy(anchorId = newAnchor.hashCode().toString())
+        placedState = placed
+
+        debugStatusTracker.onPlaced(assetHandleId = handleId, placedAttached = isPlacedAttached())
+        return AppResult.Success(placed)
     }
 
     override fun cancelReposition() {
@@ -538,8 +639,16 @@ class ArSceneControllerImpl(
                 visible = node.isVisible
             )
             PreviewRenderState.HiddenNoStableHit
-        } catch (t: Throwable) {
-            logger.e(TAG, "Failed to update preview pose.", t)
+        } catch (error: IllegalStateException) {
+            logger.e(TAG, "Failed to update preview pose.", error)
+            bundle.node.isVisible = false
+            debugStatusTracker.onPreviewHidden(
+                assetHandleId = bundle.preparedAsset.assetHandleId,
+                attached = isPreviewAttached(bundle.node)
+            )
+            PreviewRenderState.Error("Preview pose update failed.")
+        } catch (error: RuntimeException) {
+            logger.e(TAG, "Failed to update preview pose.", error)
             bundle.node.isVisible = false
             debugStatusTracker.onPreviewHidden(
                 assetHandleId = bundle.preparedAsset.assetHandleId,
@@ -624,18 +733,9 @@ class ArSceneControllerImpl(
         deletePlacedImage()
         val sceneNodes = childNodes
         preparedBundleRegistry.values.forEach { bundle ->
-            try {
-                bundle.node.parent?.removeChildNode(bundle.node)
-            } catch (_: Throwable) {
-            }
-            try {
-                sceneNodes?.remove(bundle.node)
-            } catch (_: Throwable) {
-            }
-            try {
-                bundle.node.destroy()
-            } catch (_: Throwable) {
-            }
+            tryRemoveFromParent(bundle.node)
+            tryRemoveFromScene(sceneNodes, bundle.node)
+            bundle.node.safeDestroy(logger)
             bundle.bitmap.safeRecycle()
         }
         preparedBundleRegistry.clear()
@@ -651,12 +751,17 @@ class ArSceneControllerImpl(
         val node = placedImageNode
 
         if (node != null && anchorNode != null && node.parent == anchorNode) {
-            anchorNode.removeChildNode(node)
+            try {
+                anchorNode.removeChildNode(node)
+            } catch (error: IllegalStateException) {
+                logger.d(TAG, "Failed to remove placed image node from anchor: ${error.message}")
+            } catch (error: RuntimeException) {
+                logger.d(TAG, "Failed to remove placed image node from anchor: ${error.message}")
+            }
         }
         if (anchorNode != null) {
-            sceneNodes?.remove(anchorNode)
-            anchorNode.detachAnchor()
-            anchorNode.destroy()
+            tryRemoveFromScene(sceneNodes, anchorNode)
+            anchorNode.safeDestroy(logger)
         }
 
         placedAnchorNode = null
@@ -735,7 +840,21 @@ class ArSceneControllerImpl(
             val field = node.javaClass.getDeclaredField("alpha")
             field.isAccessible = true
             field.setFloat(node, clamped)
-        } catch (_: Throwable) {
+        } catch (error: NoSuchFieldException) {
+            logger.d(TAG, "Alpha field is unavailable: ${error.message}")
+        } catch (error: SecurityException) {
+            logger.d(TAG, "Alpha reflection blocked: ${error.message}")
+        } catch (error: IllegalAccessException) {
+            logger.d(TAG, "Alpha reflection inaccessible: ${error.message}")
+        } catch (error: IllegalArgumentException) {
+            logger.d(TAG, "Alpha reflection call invalid: ${error.message}")
+        } catch (error: InvocationTargetException) {
+            logger.d(TAG, "Alpha reflection target failed: ${error.targetException?.message ?: error.message}")
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Alpha update failed: ${error.message}")
+        } catch (error: RuntimeException) {
+            // SceneView node internals may throw runtime exceptions during material updates.
+            logger.d(TAG, "Alpha update failed: ${error.message}")
         }
     }
 
@@ -749,13 +868,24 @@ class ArSceneControllerImpl(
             "setCulling" to booleanFalse
         )
         methodCandidates.forEach { (name, value) ->
-            runCatching {
+            try {
                 val method = node.javaClass.methods.firstOrNull {
                     it.name == name &&
                         it.parameterTypes.size == 1 &&
                         it.parameterTypes[0] == Boolean::class.javaPrimitiveType
                 }
                 method?.invoke(node, value)
+            } catch (error: IllegalAccessException) {
+                logger.d(TAG, "Image material config failed for $name: ${error.message}")
+            } catch (error: IllegalArgumentException) {
+                logger.d(TAG, "Image material config failed for $name: ${error.message}")
+            } catch (error: InvocationTargetException) {
+                logger.d(TAG, "Image material config failed for $name: ${error.targetException?.message ?: error.message}")
+            } catch (error: IllegalStateException) {
+                logger.d(TAG, "Image material config failed for $name: ${error.message}")
+            } catch (error: RuntimeException) {
+                // SceneView APIs may throw runtime exceptions depending on renderer state.
+                logger.d(TAG, "Image material config failed for $name: ${error.message}")
             }
         }
     }
@@ -765,7 +895,70 @@ class ArSceneControllerImpl(
             if (!isRecycled) {
                 recycle()
             }
-        } catch (_: Throwable) {
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Bitmap recycle failed: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Bitmap recycle failed: ${error.message}")
+        }
+    }
+
+    private fun tryRemoveFromParent(node: Node) {
+        try {
+            node.parent?.removeChildNode(node)
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Failed to remove node from parent: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Failed to remove node from parent: ${error.message}")
+        }
+    }
+
+    private fun tryRemoveFromScene(sceneNodes: MutableList<Node>?, node: Node) {
+        if (sceneNodes == null) {
+            return
+        }
+        try {
+            sceneNodes.remove(node)
+        } catch (error: UnsupportedOperationException) {
+            logger.d(TAG, "Failed to remove node from scene: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Failed to remove node from scene: ${error.message}")
+        }
+    }
+
+    private fun AnchorNode.safeDestroy(logger: Logger) {
+        try {
+            detachAnchor()
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Failed to detach anchor node: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Failed to detach anchor node: ${error.message}")
+        }
+        try {
+            destroy()
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Failed to destroy anchor node: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Failed to destroy anchor node: ${error.message}")
+        }
+    }
+
+    private fun Node.safeDestroy(logger: Logger) {
+        try {
+            destroy()
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Failed to destroy node: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Failed to destroy node: ${error.message}")
+        }
+    }
+
+    private fun safeDetachAnchor(anchor: com.google.ar.core.Anchor, logger: Logger) {
+        try {
+            anchor.detach()
+        } catch (error: IllegalStateException) {
+            logger.d(TAG, "Failed to detach anchor: ${error.message}")
+        } catch (error: RuntimeException) {
+            logger.d(TAG, "Failed to detach anchor: ${error.message}")
         }
     }
 

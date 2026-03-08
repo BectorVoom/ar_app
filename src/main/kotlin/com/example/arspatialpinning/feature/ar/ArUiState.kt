@@ -6,6 +6,7 @@ import com.example.arspatialpinning.domain.model.HitTestUiModel
 import com.example.arspatialpinning.domain.model.PlacedImageState
 import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.domain.model.PreviewRenderState
+import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
 import com.example.arspatialpinning.domain.model.RecordingState
 import com.example.arspatialpinning.domain.model.RenderAssetState
 import com.example.arspatialpinning.domain.model.SelectedImage
@@ -23,6 +24,7 @@ data class ArUiState(
     val placementMode: PlacementMode = PlacementMode.WaitingForPlacement,
     val currentHit: HitTestUiModel = HitTestUiModel(),
     val recordingState: RecordingState = RecordingState.Idle,
+    val lastCompletedRecording: RecordedVideoArtifact? = null,
     val debugRenderStatus: DebugRenderStatus = DebugRenderStatus(),
     val blockingMessage: String? = null,
     val transientMessage: String? = null
@@ -55,7 +57,10 @@ data class ArUiState(
             currentHit.hasStableHit
     val canCancelReposition: Boolean = placementMode == PlacementMode.Repositioning
     val canDelete: Boolean = placedImage != null
-    val canRecord: Boolean = isArReady && recordingState is RecordingState.Idle
+    val canRecord: Boolean = recordingState is RecordingState.Idle
+    val canDownloadRecording: Boolean =
+        recordingState is RecordingState.Idle &&
+            lastCompletedRecording != null
     val isRecordingBusy: Boolean =
         recordingState is RecordingState.Preparing ||
             recordingState is RecordingState.Active ||

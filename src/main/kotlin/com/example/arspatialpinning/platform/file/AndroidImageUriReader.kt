@@ -22,65 +22,64 @@ class AndroidImageUriReader(
         validation: ImageValidationResult,
         selectionRevision: Long
     ): AppResult<SelectedImage> {
-        return try {
-            val (width, height) = decodeBounds(uri, validation.format.name)
-            if (width <= 0 || height <= 0) {
-                return AppResult.Failure(
-                    AppError.InvalidImage("Selected image could not be decoded.")
+        return when (val bounds = decodeBounds(uri, validation.format.name)) {
+            is AppResult.Failure -> bounds
+            is AppResult.Success -> {
+                val (width, height) = bounds.value
+                if (width <= 0 || height <= 0) {
+                    return AppResult.Failure(
+                        AppError.InvalidImage("Selected image could not be decoded.")
+                    )
+                }
+
+                AppResult.Success(
+                    SelectedImage(
+                        uri = uri,
+                        displayName = validation.displayName,
+                        mimeType = validation.mimeType,
+                        widthPx = width,
+                        heightPx = height,
+                        format = validation.format,
+                        selectionRevision = selectionRevision
+                    )
                 )
             }
-
-            AppResult.Success(
-                SelectedImage(
-                    uri = uri,
-                    displayName = validation.displayName,
-                    mimeType = validation.mimeType,
-                    widthPx = width,
-                    heightPx = height,
-                    format = validation.format,
-                    selectionRevision = selectionRevision
-                )
-            )
-        } catch (error: IOException) {
-            Log.e(TAG, "Failed to read selected image metadata uri=$uri", error)
-            AppResult.Failure(AppError.FileOpenFailed())
-        } catch (error: SecurityException) {
-            Log.e(TAG, "Missing read permission while reading metadata uri=$uri", error)
-            AppResult.Failure(AppError.FileOpenFailed())
         }
     }
 
     override fun decodeBitmap(selectedImage: SelectedImage): AppResult<Bitmap> {
-        return try {
-            if (selectedImage.widthPx <= 0 || selectedImage.heightPx <= 0) {
-                return AppResult.Failure(
-                    AppError.DimensionOnlySuccessAttempted()
-                )
-            }
-
-            val inSampleSize = computeInSampleSize(
-                width = selectedImage.widthPx,
-                height = selectedImage.heightPx
+        if (selectedImage.widthPx <= 0 || selectedImage.heightPx <= 0) {
+            return AppResult.Failure(
+                AppError.DimensionOnlySuccessAttempted()
             )
-            val decodeOptions = BitmapFactory.Options().apply {
-                this.inSampleSize = inSampleSize
-                this.inPreferredConfig = if (selectedImage.format == ImageFormat.Png) {
-                    Bitmap.Config.ARGB_8888
-                } else {
-                    Bitmap.Config.RGB_565
-                }
-            }
+        }
 
-            val decodeStream = uriStreamOpener.openForRead(selectedImage.uri)
-            if (decodeStream == null) {
-                Log.e(TAG, "Unable to decode bitmap because stream open returned null. uri=${selectedImage.uri}")
-                return AppResult.Failure(AppError.FileOpenFailed())
+        val inSampleSize = computeInSampleSize(
+            width = selectedImage.widthPx,
+            height = selectedImage.heightPx
+        )
+        val decodeOptions = BitmapFactory.Options().apply {
+            this.inSampleSize = inSampleSize
+            this.inPreferredConfig = if (selectedImage.format == ImageFormat.Png) {
+                Bitmap.Config.ARGB_8888
+            } else {
+                Bitmap.Config.RGB_565
             }
+        }
 
+        val streamResult = uriStreamOpener.openForRead(selectedImage.uri)
+        val decodeStream = when (streamResult) {
+            is AppResult.Success -> streamResult.value
+            is AppResult.Failure -> {
+                Log.e(TAG, "Unable to decode bitmap because stream open failed. uri=${selectedImage.uri}")
+                return streamResult
+            }
+        }
+
+        return try {
             val bitmap = decodeStream.use { input ->
                 BitmapFactory.decodeStream(input, null, decodeOptions)
             } ?: return AppResult.Failure(AppError.InvalidImage("Failed to decode the selected image."))
-
             AppResult.Success(bitmap)
         } catch (error: IOException) {
             Log.e(TAG, "Failed to decode selected image uri=${selectedImage.uri}", error)
@@ -88,25 +87,47 @@ class AndroidImageUriReader(
         } catch (error: SecurityException) {
             Log.e(TAG, "Missing read permission for selected image uri=${selectedImage.uri}", error)
             AppResult.Failure(AppError.FileOpenFailed())
+        } catch (error: IllegalArgumentException) {
+            Log.e(TAG, "Invalid decode options for selected image uri=${selectedImage.uri}", error)
+            AppResult.Failure(AppError.InvalidImage("Failed to decode the selected image."))
+        } catch (error: IllegalStateException) {
+            Log.e(TAG, "Bitmap decode failed for selected image uri=${selectedImage.uri}", error)
+            AppResult.Failure(AppError.InvalidImage("Failed to decode the selected image."))
         }
     }
 
-    private fun decodeBounds(uri: Uri, formatName: String): Pair<Int, Int> {
+    private fun decodeBounds(uri: Uri, formatName: String): AppResult<Pair<Int, Int>> {
         val boundsOptions = BitmapFactory.Options().apply {
             inJustDecodeBounds = true
         }
 
-        val boundsStream = uriStreamOpener.openForRead(uri)
-        if (boundsStream == null) {
-            Log.e(TAG, "Unable to decode bounds because stream open returned null. uri=$uri format=$formatName")
-            throw IOException("Unable to open URI for bounds decode")
+        val streamResult = uriStreamOpener.openForRead(uri)
+        val boundsStream = when (streamResult) {
+            is AppResult.Success -> streamResult.value
+            is AppResult.Failure -> {
+                Log.e(TAG, "Unable to decode bounds because stream open failed. uri=$uri format=$formatName")
+                return streamResult
+            }
         }
 
-        boundsStream.use { input ->
-            BitmapFactory.decodeStream(input, null, boundsOptions)
+        return try {
+            boundsStream.use { input ->
+                BitmapFactory.decodeStream(input, null, boundsOptions)
+            }
+            AppResult.Success(boundsOptions.outWidth to boundsOptions.outHeight)
+        } catch (error: IOException) {
+            Log.e(TAG, "Failed to decode bounds for selected image uri=$uri format=$formatName", error)
+            AppResult.Failure(AppError.FileOpenFailed())
+        } catch (error: SecurityException) {
+            Log.e(TAG, "Missing read permission while decoding bounds uri=$uri format=$formatName", error)
+            AppResult.Failure(AppError.FileOpenFailed())
+        } catch (error: IllegalArgumentException) {
+            Log.e(TAG, "Invalid bounds decode request uri=$uri format=$formatName", error)
+            AppResult.Failure(AppError.InvalidImage("Selected image could not be decoded."))
+        } catch (error: IllegalStateException) {
+            Log.e(TAG, "Bounds decode failed uri=$uri format=$formatName", error)
+            AppResult.Failure(AppError.InvalidImage("Selected image could not be decoded."))
         }
-
-        return boundsOptions.outWidth to boundsOptions.outHeight
     }
 
     private fun computeInSampleSize(width: Int, height: Int): Int {

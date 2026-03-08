@@ -1,13 +1,12 @@
 package com.example.arspatialpinning.feature.ar
 
-import android.app.Activity
 import android.app.Application
+import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.net.Uri
 import androidx.arch.core.executor.testing.InstantTaskExecutorRule
-import app.cash.turbine.test
 import com.example.arspatialpinning.common.AppError
 import com.example.arspatialpinning.common.AppResult
 import com.example.arspatialpinning.common.DefaultDispatcherProvider
@@ -19,11 +18,13 @@ import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.domain.model.PlacementTransform
 import com.example.arspatialpinning.domain.model.PreparedRenderAsset
 import com.example.arspatialpinning.domain.model.PreviewRenderState
+import com.example.arspatialpinning.domain.model.RecordedVideoArtifact
 import com.example.arspatialpinning.domain.model.RecordingState
 import com.example.arspatialpinning.domain.model.RenderAssetState
 import com.example.arspatialpinning.domain.model.SelectedImage
 import com.example.arspatialpinning.domain.usecase.ConfirmRepositionUseCase
 import com.example.arspatialpinning.domain.usecase.DeleteImageUseCase
+import com.example.arspatialpinning.domain.usecase.DownloadRecordingUseCase
 import com.example.arspatialpinning.domain.usecase.EnterRepositionModeUseCase
 import com.example.arspatialpinning.domain.usecase.LoadImageUseCase
 import com.example.arspatialpinning.domain.usecase.PlaceImageUseCase
@@ -38,11 +39,12 @@ import com.example.arspatialpinning.platform.file.ImageUriReader
 import com.example.arspatialpinning.platform.file.ImageValidationResult
 import com.example.arspatialpinning.platform.file.ImageValidator
 import com.example.arspatialpinning.platform.media.RecordingController
+import com.example.arspatialpinning.platform.media.RecordingExporter
+import com.example.arspatialpinning.platform.media.SharedRecordingStateHolder
 import com.google.ar.core.Frame
 import com.google.ar.core.Session
 import com.google.android.filament.Engine
 import io.github.sceneview.node.Node
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -52,7 +54,6 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -83,8 +84,7 @@ class ArViewModelTest {
         )
         val viewModel = buildViewModel(
             loadImageUseCase = fakeLoadImageUseCase,
-            arSceneController = fakeArController,
-            recordingController = FakeRecordingController()
+            arSceneController = fakeArController
         )
 
         viewModel.onImageSelected(Uri.parse("content://test/success.png"))
@@ -101,13 +101,9 @@ class ArViewModelTest {
         val fakeArController = FakeArSceneController().apply {
             prepareResult = AppResult.Failure(AppError.PreviewRenderCreationFailed("Preview failed"))
         }
-        val fakeLoadImageUseCase = FakeLoadImageUseCase(
-            result = AppResult.Success(createSelectedImage(selectionRevision = 2L))
-        )
         val viewModel = buildViewModel(
-            loadImageUseCase = fakeLoadImageUseCase,
-            arSceneController = fakeArController,
-            recordingController = FakeRecordingController()
+            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 2L))),
+            arSceneController = fakeArController
         )
 
         viewModel.onImageSelected(Uri.parse("content://test/failure.png"))
@@ -126,8 +122,7 @@ class ArViewModelTest {
         }
         val viewModel = buildViewModel(
             loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 3L))),
-            arSceneController = fakeArController,
-            recordingController = FakeRecordingController()
+            arSceneController = fakeArController
         )
 
         viewModel.onImageSelected(Uri.parse("content://test/metadata-only.png"))
@@ -142,8 +137,7 @@ class ArViewModelTest {
         val fakeArController = FakeArSceneController()
         val viewModel = buildViewModel(
             loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 4L))),
-            arSceneController = fakeArController,
-            recordingController = FakeRecordingController()
+            arSceneController = fakeArController
         )
 
         viewModel.setUiStateForTest(
@@ -173,141 +167,82 @@ class ArViewModelTest {
     }
 
     @Test
-    fun recordClick_withoutMicrophonePermission_requestsPermission() = runTest {
-        val viewModel = buildViewModel(
-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 5L))),
-            arSceneController = FakeArSceneController(),
-            recordingController = FakeRecordingController()
-        )
-        viewModel.onArScreenResumed()
-        viewModel.setUiStateForTest(ArUiState(isArReady = true))
-
-        viewModel.sideEffects.test {
-            viewModel.onUiEvent(
-                event = ArUiEvent.RecordClicked,
-                hasRecordAudioPermission = false
-            )
-            advanceUntilIdle()
-
-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Preparing)
-            assertEquals(ArSideEffect.RequestRecordAudioPermission, awaitItem())
-            cancelAndIgnoreRemainingEvents()
-        }
-    }
-
-    @Test
-    fun mediaProjectionDenied_resetsIdle_andShowsSnackbar() = runTest {
-        val viewModel = buildViewModel(
-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 6L))),
-            arSceneController = FakeArSceneController(),
-            recordingController = FakeRecordingController()
-        )
-        viewModel.onArScreenResumed()
-        viewModel.setUiStateForTest(ArUiState(isArReady = true))
-
-        viewModel.sideEffects.test {
-            viewModel.onUiEvent(
-                event = ArUiEvent.RecordClicked,
-                hasRecordAudioPermission = true
-            )
-            advanceUntilIdle()
-            assertTrue(awaitItem() is ArSideEffect.RequestMediaProjectionConsent)
-
-            viewModel.onMediaProjectionConsentResult(
-                resultCode = Activity.RESULT_CANCELED,
-                data = null
-            )
-            advanceUntilIdle()
-
-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Idle)
-            val effect = awaitItem()
-            assertTrue(effect is ArSideEffect.ShowSnackbar)
-            cancelAndIgnoreRemainingEvents()
-        }
-    }
-
-    @Test
-    fun stopRecording_isIdempotentWhileFinalizing() = runTest {
-        val fakeRecordingController = FakeRecordingController()
-        val stopGate = CompletableDeferred<Unit>()
-        fakeRecordingController.stopCompletion = stopGate
-        val viewModel = buildViewModel(
-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 7L))),
-            arSceneController = FakeArSceneController(),
-            recordingController = fakeRecordingController
-        )
-        viewModel.onArScreenResumed()
-        viewModel.setUiStateForTest(ArUiState(isArReady = true))
-
-        viewModel.sideEffects.test {
-            viewModel.onUiEvent(ArUiEvent.RecordClicked, hasRecordAudioPermission = true)
-            advanceUntilIdle()
-            assertTrue(awaitItem() is ArSideEffect.RequestMediaProjectionConsent)
-
-            viewModel.onMediaProjectionConsentResult(
-                resultCode = Activity.RESULT_OK,
-                data = Intent("projection-consent")
-            )
-            advanceUntilIdle()
-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Active)
-
-            viewModel.onUiEvent(ArUiEvent.StopRecordingClicked, hasRecordAudioPermission = true)
-            viewModel.onUiEvent(ArUiEvent.StopRecordingClicked, hasRecordAudioPermission = true)
-            advanceUntilIdle()
-
-            assertEquals(1, fakeRecordingController.stopCalls)
-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Finalizing)
-            stopGate.complete(Unit)
-            advanceUntilIdle()
-
-            assertTrue(viewModel.uiState.value.recordingState is RecordingState.Idle)
-            cancelAndIgnoreRemainingEvents()
-        }
-    }
-
-    @Test
-    fun onRouteExit_clearsState_andReleasesControllers() = runTest {
+    fun onRouteExit_clearsArState_butKeepsSharedRecordingState() = runTest {
         val fakeArController = FakeArSceneController()
-        val fakeRecordingController = FakeRecordingController()
+        val fakeRecordingController = FakeRecordingController().apply {
+            stopResult = AppResult.Success(
+                RecordedVideoArtifact(
+                    sourceUri = Uri.parse("content://recordings/validated.mp4"),
+                    displayName = "validated.mp4"
+                )
+            )
+        }
+        val sharedHolder = createSharedRecordingStateHolder(
+            recordingController = fakeRecordingController,
+            recordingExporter = FakeRecordingExporter()
+        )
+        sharedHolder.onAppResumed()
+        sharedHolder.onRecordAudioPermissionStateObserved(true)
+        sharedHolder.onMediaProjectionConsentResult(Activity.RESULT_OK, Intent("projection-consent"))
+        advanceUntilIdle()
+        sharedHolder.onStopRecordClick(showSavedMessage = false)
+        advanceUntilIdle()
+
         val viewModel = buildViewModel(
-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 8L))),
+            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 10L))),
             arSceneController = fakeArController,
-            recordingController = fakeRecordingController
+            sharedRecordingStateHolder = sharedHolder
+        )
+        val recordingArtifact = sharedHolder.uiState.value.lastCompletedRecording
+        viewModel.setUiStateForTest(
+            ArUiState(
+                hasCameraPermission = true,
+                isArReady = true,
+                selectedImage = createSelectedImage(selectionRevision = 10L),
+                renderAssetState = RenderAssetState.Error("x"),
+                previewRenderState = PreviewRenderState.Error("x")
+            )
         )
 
         viewModel.onRouteExit()
         advanceUntilIdle()
 
         assertEquals(1, fakeArController.releaseCalls)
-        assertEquals(1, fakeRecordingController.stopCalls)
-        assertEquals(ArUiState(), viewModel.uiState.value)
+        assertTrue(viewModel.uiState.value.recordingState is RecordingState.Idle)
+        assertEquals(recordingArtifact, viewModel.uiState.value.lastCompletedRecording)
+        assertEquals(RenderAssetState.None, viewModel.uiState.value.renderAssetState)
+        assertEquals(PreviewRenderState.HiddenNoSelection, viewModel.uiState.value.previewRenderState)
+        assertNull(viewModel.uiState.value.selectedImage)
+        sharedHolder.release()
     }
 
     @Test
-    fun onCameraPermissionStateObserved_revoked_disablesArReadiness() = runTest {
+    fun sharedRecordingPermission_isMirroredIntoArUiState() = runTest {
+        val fakeRecordingController = FakeRecordingController()
+        val sharedHolder = createSharedRecordingStateHolder(
+            recordingController = fakeRecordingController,
+            recordingExporter = FakeRecordingExporter()
+        )
         val viewModel = buildViewModel(
-            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 9L))),
+            loadImageUseCase = FakeLoadImageUseCase(AppResult.Success(createSelectedImage(selectionRevision = 11L))),
             arSceneController = FakeArSceneController(),
-            recordingController = FakeRecordingController()
+            sharedRecordingStateHolder = sharedHolder
         )
 
-        viewModel.setUiStateForTest(
-            ArUiState(
-                hasCameraPermission = true,
-                isArReady = true
-            )
-        )
+        sharedHolder.onRecordAudioPermissionStateObserved(true)
+        advanceUntilIdle()
 
-        viewModel.onCameraPermissionStateObserved(granted = false)
-
-        assertFalse(viewModel.uiState.value.hasCameraPermission)
-        assertFalse(viewModel.uiState.value.isArReady)
+        assertTrue(viewModel.uiState.value.hasRecordAudioPermission)
+        sharedHolder.release()
     }
 
     private fun buildViewModel(
         loadImageUseCase: LoadImageUseCase,
         arSceneController: ArSceneController,
-        recordingController: RecordingController
+        sharedRecordingStateHolder: SharedRecordingStateHolder = createSharedRecordingStateHolder(
+            recordingController = FakeRecordingController(),
+            recordingExporter = FakeRecordingExporter()
+        )
     ): ArViewModel {
         val context = RuntimeEnvironment.getApplication() as Application
 
@@ -318,11 +253,21 @@ class ArViewModelTest {
             deleteImageUseCase = DeleteImageUseCase(),
             enterRepositionModeUseCase = EnterRepositionModeUseCase(),
             confirmRepositionUseCase = ConfirmRepositionUseCase(),
+            arAvailabilityChecker = ArAvailabilityChecker(context),
+            arSceneController = arSceneController,
+            sharedRecordingStateHolder = sharedRecordingStateHolder
+        )
+    }
+
+    private fun createSharedRecordingStateHolder(
+        recordingController: RecordingController,
+        recordingExporter: RecordingExporter
+    ): SharedRecordingStateHolder {
+        return SharedRecordingStateHolder(
             requestRecordingUseCase = RequestRecordingUseCase(),
             startRecordingUseCase = StartRecordingUseCase(recordingController),
             stopRecordingUseCase = StopRecordingUseCase(recordingController),
-            arAvailabilityChecker = ArAvailabilityChecker(context),
-            arSceneController = arSceneController,
+            downloadRecordingUseCase = DownloadRecordingUseCase(recordingExporter),
             recordingController = recordingController
         )
     }
@@ -447,11 +392,10 @@ class ArViewModelTest {
     }
 
     private class FakeRecordingController : RecordingController {
-        var stopCalls: Int = 0
-        var stopCompletion: CompletableDeferred<Unit>? = null
+        var stopResult: AppResult<RecordedVideoArtifact?> = AppResult.Success(null)
         override var onProjectionStopped: (() -> Unit)? = null
 
-        override fun createConsentIntent(): Intent = Intent("projection-consent")
+        override fun createConsentIntent(): AppResult<Intent> = AppResult.Success(Intent("projection-consent"))
 
         override suspend fun startRecording(
             consentResultCode: Int,
@@ -459,13 +403,15 @@ class ArViewModelTest {
             maximumWindowBounds: Rect
         ): AppResult<Unit> = AppResult.Success(Unit)
 
-        override suspend fun stopRecording(): AppResult<Unit> {
-            stopCalls += 1
-            stopCompletion?.await()
-            return AppResult.Success(Unit)
-        }
+        override suspend fun stopRecording(): AppResult<RecordedVideoArtifact?> = stopResult
 
         override fun release() = Unit
+    }
+
+    private class FakeRecordingExporter : RecordingExporter {
+        override suspend fun exportRecording(sourceUri: Uri, destinationUri: Uri): AppResult<Unit> {
+            return AppResult.Success(Unit)
+        }
     }
 
     class MainDispatcherRule(
@@ -479,4 +425,5 @@ class ArViewModelTest {
             Dispatchers.resetMain()
         }
     }
+
 }

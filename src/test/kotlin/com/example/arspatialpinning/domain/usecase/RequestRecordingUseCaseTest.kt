@@ -10,9 +10,9 @@ class RequestRecordingUseCaseTest {
     private val useCase = RequestRecordingUseCase()
 
     @Test
-    fun `recording can be requested from idle and failed states`() {
+    fun `recording can be requested from idle state only`() {
         assertTrue(useCase(RecordingState.Idle))
-        assertTrue(useCase(RecordingState.Failed("error")))
+        assertFalse(useCase(RecordingState.Failed("error")))
     }
 
     @Test

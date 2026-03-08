@@ -1,9 +1,6 @@
 package com.example.arspatialpinning.feature.ar
 
 import android.Manifest
-import android.app.Activity
-import android.content.Context
-import android.content.ContextWrapper
 import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,13 +22,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.window.layout.WindowMetricsCalculator
 import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.feature.ar.component.ArControls
 import com.example.arspatialpinning.feature.ar.component.ArToolbar
@@ -54,35 +49,18 @@ fun ArScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
-    val activity = context.findActivity()
     val lifecycleOwner = LocalLifecycleOwner.current
-    val containerSize = LocalWindowInfo.current.containerSize
 
     val openImageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        viewModel.onImageSelected(uri)
+        viewModel.onUiEvent(ArUiEvent.OnImageSelected(uri))
     }
 
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         viewModel.onCameraPermissionResult(granted)
-    }
-
-    val recordAudioPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        viewModel.onRecordAudioPermissionResult(granted)
-    }
-
-    val mediaProjectionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        viewModel.onMediaProjectionConsentResult(
-            resultCode = result.resultCode,
-            data = result.data
-        )
     }
 
     val engine = rememberEngine()
@@ -93,18 +71,8 @@ fun ArScreen(
     var viewportWidthPx by remember { mutableIntStateOf(0) }
     var viewportHeightPx by remember { mutableIntStateOf(0) }
 
-    val hasRecordAudioPermission = {
-        ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.RECORD_AUDIO
-        ) == PackageManager.PERMISSION_GRANTED
-    }
-
     BackHandler {
-        viewModel.onUiEvent(
-            event = ArUiEvent.BackClicked,
-            hasRecordAudioPermission = hasRecordAudioPermission()
-        )
+        viewModel.onUiEvent(ArUiEvent.OnBackClick)
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -148,15 +116,6 @@ fun ArScreen(
         viewModel.onScreenEntered(cameraGranted)
     }
 
-    LaunchedEffect(containerSize) {
-        activity?.let {
-            val bounds = WindowMetricsCalculator.getOrCreate()
-                .computeMaximumWindowMetrics(it)
-                .bounds
-            viewModel.onMaximumWindowBoundsChanged(bounds)
-        }
-    }
-
     LaunchedEffect(Unit) {
         viewModel.sideEffects.collect { sideEffect ->
             when (sideEffect) {
@@ -165,14 +124,6 @@ fun ArScreen(
                 }
                 ArSideEffect.RequestCameraPermission -> {
                     cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-                }
-
-                ArSideEffect.RequestRecordAudioPermission -> {
-                    recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                }
-
-                is ArSideEffect.RequestMediaProjectionConsent -> {
-                    mediaProjectionLauncher.launch(sideEffect.intent)
                 }
 
                 is ArSideEffect.ShowSnackbar -> snackbarHostState.showSnackbar(sideEffect.message)
@@ -186,10 +137,7 @@ fun ArScreen(
             ArToolbar(
                 recordingState = uiState.recordingState,
                 onBack = {
-                    viewModel.onUiEvent(
-                        event = ArUiEvent.BackClicked,
-                        hasRecordAudioPermission = hasRecordAudioPermission()
-                    )
+                    viewModel.onUiEvent(ArUiEvent.OnBackClick)
                 }
             )
         },
@@ -197,12 +145,7 @@ fun ArScreen(
         bottomBar = {
             ArControls(
                 uiState = uiState,
-                onEvent = { event ->
-                    viewModel.onUiEvent(
-                        event = event,
-                        hasRecordAudioPermission = hasRecordAudioPermission()
-                    )
-                }
+                onEvent = { event -> viewModel.onUiEvent(event) }
             )
         }
     ) { innerPadding ->
@@ -249,10 +192,8 @@ fun ArScreen(
             TransformGestureOverlay(
                 enabled = uiState.placementMode == PlacementMode.Placed,
                 onTransform = { scaleFactor, rotationDegreesDelta ->
-                    viewModel.onTransformGesture(
-                        scaleFactor = scaleFactor,
-                        rotationDegreesDelta = rotationDegreesDelta
-                    )
+                    viewModel.onUiEvent(ArUiEvent.OnScaleGesture(scaleFactor))
+                    viewModel.onUiEvent(ArUiEvent.OnRotateGesture(rotationDegreesDelta))
                 }
             )
 
@@ -277,13 +218,5 @@ fun ArScreen(
                 RecordingOverlay(recordingState = uiState.recordingState)
             }
         }
-    }
-}
-
-private tailrec fun Context.findActivity(): Activity? {
-    return when (this) {
-        is Activity -> this
-        is ContextWrapper -> baseContext.findActivity()
-        else -> null
     }
 }
