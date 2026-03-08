@@ -6,8 +6,8 @@ import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaRecorder
-import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -38,6 +38,7 @@ class RecordingControllerImpl(
         context.getSystemService(MediaProjectionManager::class.java)
     }
     private val mediaStoreVideoWriter = MediaStoreVideoWriter(context.contentResolver)
+    private val recordedFileValidator = RecordedFileValidator(context, context.contentResolver)
     private val mutex = Mutex()
     private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -72,20 +73,41 @@ class RecordingControllerImpl(
         var virtualDisplay: VirtualDisplay? = null
 
         try {
-            pendingOutput = mediaStoreVideoWriter.createPendingOutput()
+            // Foreground service must be active before obtaining MediaProjection (Android 14+).
+            RecordingService.start(context)
+
+            projection = mediaProjectionManager.getMediaProjection(consentResultCode, consentData)
+                ?: return@withLock AppResult.Failure(AppError.MediaProjectionDenied())
+
+            pendingOutput = try {
+                mediaStoreVideoWriter.createPendingOutput()
+            } catch (t: Throwable) {
+                logger.e(TAG, "Failed to create MediaStore output.", t)
+                return@withLock AppResult.Failure(AppError.OutputCreationFailed())
+            }
+
             recorder = createRecorder(
                 outputFileDescriptor = pendingOutput.fileDescriptor,
                 width = captureSize.width,
                 height = captureSize.height
             )
 
-            // Foreground service must be running before obtaining MediaProjection.
-            RecordingService.start(context)
-
-            projection = mediaProjectionManager.getMediaProjection(consentResultCode, consentData)
-                ?: return@withLock AppResult.Failure(
-                    AppError.RecordingFailure("MediaProjection consent was denied.")
-                )
+            recorder.setOnInfoListener { _, what, _ ->
+                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                    callbackScope.launch {
+                        logger.d(TAG, "Max recording duration reached.")
+                        stopRecording()
+                        onProjectionStopped?.invoke()
+                    }
+                }
+            }
+            recorder.setOnErrorListener { _, _, _ ->
+                callbackScope.launch {
+                    logger.e(TAG, "Recorder reported fatal error.")
+                    stopRecording()
+                    onProjectionStopped?.invoke()
+                }
+            }
 
             callback = object : MediaProjection.Callback() {
                 override fun onStop() {
@@ -133,9 +155,7 @@ class RecordingControllerImpl(
             )
             pendingOutput?.uri?.let(mediaStoreVideoWriter::deleteOutput)
             RecordingService.stop(context)
-            AppResult.Failure(
-                AppError.RecordingFailure("Unable to start recording.")
-            )
+            AppResult.Failure(AppError.RecorderStartFailed())
         }
     }
 
@@ -159,21 +179,25 @@ class RecordingControllerImpl(
             outputPfd = current.outputPfd
         )
 
-        if (stopSucceeded) {
-            mediaStoreVideoWriter.finalizeOutput(current.outputUri)
-            logger.d(TAG, "Recording finalized: ${current.outputUri}")
+        val result = if (stopSucceeded) {
+            when (val validation = recordedFileValidator.validate(current.outputUri)) {
+                is AppResult.Success -> {
+                    mediaStoreVideoWriter.finalizeOutput(current.outputUri)
+                    AppResult.Success(Unit)
+                }
+
+                is AppResult.Failure -> {
+                    mediaStoreVideoWriter.deleteOutput(current.outputUri)
+                    validation
+                }
+            }
         } else {
             mediaStoreVideoWriter.deleteOutput(current.outputUri)
-            logger.d(TAG, "Recording file discarded due to stop failure: ${current.outputUri}")
+            AppResult.Failure(AppError.RecorderStopFailed())
         }
 
         RecordingService.stop(context)
-
-        return@withLock if (stopSucceeded) {
-            AppResult.Success(Unit)
-        } else {
-            AppResult.Failure(AppError.RecordingFailure("Recording failed during finalization."))
-        }
+        result
     }
 
     override fun release() {

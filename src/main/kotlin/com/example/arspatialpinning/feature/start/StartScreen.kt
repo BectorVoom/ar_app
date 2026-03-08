@@ -32,7 +32,7 @@ fun StartScreen(
             onClick = onStartAr,
             modifier = Modifier.padding(top = 24.dp)
         ) {
-            Text(text = "Start AR")
+            Text(text = "Start AR Session")
         }
     }
 }

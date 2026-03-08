@@ -10,7 +10,8 @@ import java.util.Date
 import java.util.Locale
 
 class MediaStoreVideoWriter(
-    private val contentResolver: ContentResolver
+    private val contentResolver: ContentResolver,
+    private val nowProvider: () -> Date = { Date() }
 ) {
 
     data class PendingOutput(
@@ -19,8 +20,7 @@ class MediaStoreVideoWriter(
     )
 
     fun createPendingOutput(): PendingOutput {
-        val now = Date()
-        val fileName = "ar_recording_${FILE_NAME_FORMAT.format(now)}.mp4"
+        val fileName = generateFileName(nowProvider())
         val contentValues = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -48,6 +48,10 @@ class MediaStoreVideoWriter(
 
     fun deleteOutput(uri: Uri) {
         contentResolver.delete(uri, null, null)
+    }
+
+    fun generateFileName(date: Date): String {
+        return "ar_recording_${FILE_NAME_FORMAT.format(date)}.mp4"
     }
 
     private companion object {

@@ -7,15 +7,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
-import com.example.arspatialpinning.feature.ar.ReticleUiState
+import com.example.arspatialpinning.domain.model.HitTestUiModel
 
 @Composable
 fun ReticleOverlay(
-    reticleState: ReticleUiState
+    hitState: HitTestUiModel
 ) {
     val color = when {
-        reticleState.isStabilized -> Color(0xFF22C55E)
-        reticleState.hasValidHit -> Color(0xFFF59E0B)
+        hitState.hasStableHit -> Color(0xFF22C55E)
+        hitState.hasValidHit -> Color(0xFFF59E0B)
         else -> Color(0xFFEF4444)
     }
 

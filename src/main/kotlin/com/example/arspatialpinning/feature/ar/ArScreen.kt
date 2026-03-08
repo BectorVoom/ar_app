@@ -8,8 +8,6 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -40,6 +38,7 @@ import com.example.arspatialpinning.feature.ar.component.ArToolbar
 import com.example.arspatialpinning.feature.ar.component.BlockingPanel
 import com.example.arspatialpinning.feature.ar.component.RecordingOverlay
 import com.example.arspatialpinning.feature.ar.component.ReticleOverlay
+import com.example.arspatialpinning.feature.ar.component.TransformGestureOverlay
 import com.google.ar.core.Config
 import io.github.sceneview.ar.ARScene
 import io.github.sceneview.rememberCollisionSystem
@@ -94,13 +93,6 @@ fun ArScreen(
     var viewportWidthPx by remember { mutableIntStateOf(0) }
     var viewportHeightPx by remember { mutableIntStateOf(0) }
 
-    val transformableState = rememberTransformableState { zoomChange, _, rotationChange ->
-        viewModel.onTransformGesture(
-            scaleFactor = zoomChange,
-            rotationDegreesDelta = rotationChange
-        )
-    }
-
     val hasRecordAudioPermission = {
         ContextCompat.checkSelfPermission(
             context,
@@ -118,8 +110,16 @@ fun ArScreen(
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> viewModel.onArScreenResumed()
+                Lifecycle.Event.ON_RESUME -> {
+                    val cameraGranted = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.CAMERA
+                    ) == PackageManager.PERMISSION_GRANTED
+                    viewModel.onCameraPermissionStateObserved(cameraGranted)
+                    viewModel.onArScreenResumed()
+                }
                 Lifecycle.Event.ON_PAUSE -> viewModel.onArScreenPaused()
+                Lifecycle.Event.ON_STOP -> viewModel.onArScreenStopped()
                 else -> Unit
             }
         }
@@ -214,10 +214,6 @@ fun ArScreen(
                     viewportWidthPx = it.width
                     viewportHeightPx = it.height
                 }
-                .transformable(
-                    state = transformableState,
-                    enabled = uiState.placementMode == PlacementMode.Placed
-                )
         ) {
             ARScene(
                 modifier = Modifier.fillMaxSize(),
@@ -229,11 +225,7 @@ fun ArScreen(
                 sessionConfiguration = { session, config ->
                     config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
                     config.lightEstimationMode = Config.LightEstimationMode.DISABLED
-                    config.depthMode = if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
-                        Config.DepthMode.AUTOMATIC
-                    } else {
-                        Config.DepthMode.DISABLED
-                    }
+                    config.depthMode = Config.DepthMode.DISABLED
                     config.instantPlacementMode = Config.InstantPlacementMode.DISABLED
                     config.cloudAnchorMode = Config.CloudAnchorMode.DISABLED
                     config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
@@ -250,19 +242,34 @@ fun ArScreen(
                             viewportHeightPx = viewportHeightPx
                         )
                     }
+                },
+                onGestureListener = null
+            )
+
+            TransformGestureOverlay(
+                enabled = uiState.placementMode == PlacementMode.Placed,
+                onTransform = { scaleFactor, rotationDegreesDelta ->
+                    viewModel.onTransformGesture(
+                        scaleFactor = scaleFactor,
+                        rotationDegreesDelta = rotationDegreesDelta
+                    )
                 }
             )
 
-            ReticleOverlay(reticleState = uiState.reticle)
+            if (uiState.placementMode == PlacementMode.WaitingForPlacement ||
+                uiState.placementMode == PlacementMode.Repositioning
+            ) {
+                ReticleOverlay(hitState = uiState.currentHit)
+            }
 
-            val blockingError = uiState.blockingError
-            if (!uiState.cameraPermissionGranted) {
+            val blockingMessage = uiState.blockingMessage
+            if (!uiState.hasCameraPermission) {
                 Box(modifier = Modifier.align(Alignment.TopCenter)) {
                     BlockingPanel(message = "Camera permission is required.")
                 }
-            } else if (blockingError != null) {
+            } else if (blockingMessage != null) {
                 Box(modifier = Modifier.align(Alignment.TopCenter)) {
-                    BlockingPanel(message = blockingError.message)
+                    BlockingPanel(message = blockingMessage)
                 }
             }
 

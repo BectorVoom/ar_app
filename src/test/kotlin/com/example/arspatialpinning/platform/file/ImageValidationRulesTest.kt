@@ -1,81 +1,101 @@
 package com.example.arspatialpinning.platform.file
 
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import com.example.arspatialpinning.domain.model.ImageFormat
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class ImageValidationRulesTest {
 
     @Test
-    fun `png mime and png signature is valid`() {
-        val result = ImageValidationRules.isSupportedImage(
+    fun `png mime and signature resolves to png`() {
+        val format = ImageValidationRules.resolveFormat(
             mimeType = "image/png",
             displayName = "image.png",
             header = PNG_SIGNATURE,
-            headerLength = PNG_SIGNATURE.size
+            headerLength = PNG_SIGNATURE.size,
+            hasJpegEndOfImage = false
         )
 
-        assertTrue(result)
+        assertEquals(ImageFormat.Png, format)
     }
 
     @Test
-    fun `jpeg mime and jpeg signature is valid`() {
-        val result = ImageValidationRules.isSupportedImage(
+    fun `jpeg mime signature and eoi resolves to jpeg`() {
+        val format = ImageValidationRules.resolveFormat(
             mimeType = "image/jpeg",
-            displayName = "image.jpeg",
-            header = JPEG_SIGNATURE,
-            headerLength = JPEG_SIGNATURE.size
-        )
-
-        assertTrue(result)
-    }
-
-    @Test
-    fun `unsupported mime is invalid even with png signature`() {
-        val result = ImageValidationRules.isSupportedImage(
-            mimeType = "application/octet-stream",
-            displayName = "image.png",
-            header = PNG_SIGNATURE,
-            headerLength = PNG_SIGNATURE.size
-        )
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `mime and signature mismatch is invalid`() {
-        val result = ImageValidationRules.isSupportedImage(
-            mimeType = "image/png",
-            displayName = "image.png",
-            header = JPEG_SIGNATURE,
-            headerLength = JPEG_SIGNATURE.size
-        )
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `unsupported extension is invalid even when mime and signature are jpeg`() {
-        val result = ImageValidationRules.isSupportedImage(
-            mimeType = "image/jpeg",
-            displayName = "image.webp",
-            header = JPEG_SIGNATURE,
-            headerLength = JPEG_SIGNATURE.size
-        )
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `missing mime is accepted when extension and signature are valid`() {
-        val result = ImageValidationRules.isSupportedImage(
-            mimeType = null,
             displayName = "image.jpg",
             header = JPEG_SIGNATURE,
-            headerLength = JPEG_SIGNATURE.size
+            headerLength = JPEG_SIGNATURE.size,
+            hasJpegEndOfImage = true
         )
 
-        assertTrue(result)
+        assertEquals(ImageFormat.Jpeg, format)
+    }
+
+    @Test
+    fun `jpeg missing eoi is rejected`() {
+        val format = ImageValidationRules.resolveFormat(
+            mimeType = "image/jpeg",
+            displayName = "image.jpg",
+            header = JPEG_SIGNATURE,
+            headerLength = JPEG_SIGNATURE.size,
+            hasJpegEndOfImage = false
+        )
+
+        assertNull(format)
+    }
+
+    @Test
+    fun `mime signature mismatch is rejected`() {
+        val format = ImageValidationRules.resolveFormat(
+            mimeType = "image/png",
+            displayName = "image.png",
+            header = JPEG_SIGNATURE,
+            headerLength = JPEG_SIGNATURE.size,
+            hasJpegEndOfImage = true
+        )
+
+        assertNull(format)
+    }
+
+    @Test
+    fun `missing mime falls back to extension and header`() {
+        val format = ImageValidationRules.resolveFormat(
+            mimeType = null,
+            displayName = "photo.jpeg",
+            header = JPEG_SIGNATURE,
+            headerLength = JPEG_SIGNATURE.size,
+            hasJpegEndOfImage = true
+        )
+
+        assertEquals(ImageFormat.Jpeg, format)
+    }
+
+    @Test
+    fun `unsupported mime falls back to extension and header`() {
+        val format = ImageValidationRules.resolveFormat(
+            mimeType = "application/octet-stream",
+            displayName = "photo.png",
+            header = PNG_SIGNATURE,
+            headerLength = PNG_SIGNATURE.size,
+            hasJpegEndOfImage = false
+        )
+
+        assertEquals(ImageFormat.Png, format)
+    }
+
+    @Test
+    fun `missing mime and missing display name still falls back to signature`() {
+        val format = ImageValidationRules.resolveFormat(
+            mimeType = null,
+            displayName = null,
+            header = PNG_SIGNATURE,
+            headerLength = PNG_SIGNATURE.size,
+            hasJpegEndOfImage = false
+        )
+
+        assertEquals(ImageFormat.Png, format)
     }
 
     private companion object {

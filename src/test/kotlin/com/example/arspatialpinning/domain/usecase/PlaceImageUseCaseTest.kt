@@ -1,8 +1,6 @@
 package com.example.arspatialpinning.domain.usecase
 
-import android.graphics.Bitmap
-import android.net.Uri
-import com.example.arspatialpinning.domain.model.SelectedImage
+import com.example.arspatialpinning.domain.model.PreparedRenderAsset
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -16,16 +14,18 @@ class PlaceImageUseCaseTest {
     private val useCase = PlaceImageUseCase()
 
     @Test
-    fun `createPlacedState uses default height and keeps aspect ratio`() {
-        val bitmap = Bitmap.createBitmap(400, 200, Bitmap.Config.ARGB_8888)
-        val selectedImage = SelectedImage(
-            uri = Uri.parse("content://test/image.png"),
-            bitmap = bitmap
+    fun `createPlacedState uses default height and keeps prepared asset aspect ratio`() {
+        val preparedAsset = PreparedRenderAsset(
+            assetHandleId = "asset-1",
+            widthPx = 400,
+            heightPx = 200,
+            aspectRatio = 2f,
+            selectionRevision = 7L
         )
 
         val placed = useCase.createPlacedState(
             anchorId = "anchor-1",
-            selectedImage = selectedImage
+            preparedAsset = preparedAsset
         )
 
         assertEquals(0.30f, placed.heightMeters, 0.0001f)

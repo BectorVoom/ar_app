@@ -5,5 +5,6 @@ import com.google.ar.core.Pose
 data class HitTestResult(
     val hitPose: Pose,
     val cameraPose: Pose,
-    val trackableId: String
+    val trackableId: String,
+    val distanceMeters: Float
 )

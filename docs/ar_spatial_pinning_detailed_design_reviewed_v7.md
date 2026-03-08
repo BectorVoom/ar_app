@@ -1,8 +1,8 @@
-# Detailed Design Specification
+﻿# Detailed Design Specification
 ## Android AR Spatial Image Pinning App
 
-**Document Version:** 1.5  
-**Document Status:** Revised After Implementation Feedback  
+**Document Version:** 1.7  
+**Document Status:** Updated to Match Implemented Code and Latest Product Overrides  
 **Language:** English  
 **Target OS Support:** Android 12L / API 32  
 **Implementation Stack:** Kotlin, Jetpack Compose, SceneView, ARCore  
@@ -11,55 +11,103 @@
 
 ## 1. Purpose
 
-This document defines the detailed design for an Android application that allows a user to select a single PNG or JPEG image, preview and place that image at an arbitrary real-world position in an AR scene, manipulate that image, and record the AR screen with microphone audio.
+This document defines the detailed design for an Android application that allows a user to select a single PNG or JPEG image, preview and place that image at an arbitrary real-world position in an AR scene, manipulate that image, and record the AR screen session with microphone audio.
 
-This revision incorporates implementation feedback from vibe-coded development and corrects the remaining issues found in the prior reviewed version, with the goal of making the specification internally consistent, technically feasible on Android API 32+, and precise enough to avoid implementation drift.
+This revision incorporates the second round of implementation feedback and focuses on **root-cause elimination**, not only wording cleanup. The previous version still left two critical failure paths open:
+
+1. the selected image could be accepted as data but never become a confirmed visible AR renderable, and  
+2. the recording design and policy text were inconsistent with the latest requirement that platform-default MediaProjection capture behavior is acceptable.
+
+This revision therefore strengthens:
+- the render-pipeline contract from file selection to visible preview to final placement,
+- the visibility and scene-attachment rules for preview/placed nodes,
+- the recording lifecycle robustness rules,
+- the capture-start and saved-file validation rules for recording, and
+- the automated and manual test design required to prove these behaviors on device.
+
+### 1.1 v7 Update Notes (Authoritative Overrides)
+
+This v7 document reflects the latest implemented code and supersedes conflicting older statements in this file.
+
+1. Recording scope policy is updated:
+   - recording is initiated from the AR route and tied to AR route lifecycle,
+   - platform-default MediaProjection capture behavior is accepted,
+   - API 32/33 full-display capture is acceptable,
+   - Android 14+ app-window or full-display capture is acceptable depending on user choice,
+   - recording is **not** capability-gated on app-window-sharing availability.
+
+2. File picker reliability is hardened for real-device providers:
+   - URI open fallback order:
+     - `openInputStream(uri)`
+     - `openAssetFileDescriptor(uri, "r")`
+     - `openFileDescriptor(uri, "r")`
+     - `openTypedAssetFileDescriptor(uri, mimeType, null)` with MIME candidates (`image/png`, `image/jpeg`, `image/jpg`, `image/*`, `*/*`),
+   - temporary read-permission guard around load flow,
+   - no long-term URI permission retention across restarts.
+
+3. `Place` enablement remains strict and unchanged:
+   - requires AR ready + selected image + `RenderAssetState.Ready` + `PreviewRenderState.Visible` + stable hit + waiting placement mode.
+
+4. State model alignment with code:
+   - `recordingCapability` is removed from `ArUiState`,
+   - `canRecord` depends on `recordingState is Idle`,
+   - `Select Image` is disabled while recording is preparing/active/finalizing via `recordingState.blocksImageSelection`.
+
+5. New test focus in v7:
+   - URI typed-stream fallback candidate generation,
+   - fallback ordering behavior for stream open attempts,
+   - real-device validation for the previously reported `Unable to open the selected file` path.
+
+Note: Any remaining legacy text in this file that claims AR-only recording capability gating should be interpreted as historical context and overridden by this section.
 
 ---
 
 ## 2. Review Summary
 
-The previous version was generally usable as a first implementation draft, but it had several issues that required correction.
+The previous version corrected several first-pass issues, but it still permitted implementation failure in the two places that matter most for the product requirement: **visible AR placement** and **usable recording output**.
 
-### 2.1 Main Review Findings
+### 2.1 Root-Cause Findings
 
-1. **Light estimation was still over-specified relative to the actual rendering model**  
-   The document enabled AR light estimation and used `ENVIRONMENTAL_HDR`, even though the placed image is rendered with an unlit material and does not use AR lighting inputs. This added configuration complexity without product value.
+1. **Renderable readiness was not part of the state contract**  
+   `selectedImage` meant only that file metadata had been accepted. The state model did not require the image texture, material, and preview node to be prepared successfully before the UI enabled placement. As a result, an implementation could accept the file yet never produce a visible preview or placed node.
 
-2. **The MediaProjection token/session contract needed one more level of precision**  
-   The prior version said that consent is requested per session, but it did not explicitly prohibit caching the consent result or reusing one `MediaProjection` instance for multiple `createVirtualDisplay()` calls. Android 14+ treats each consent grant as a single capture session and requires callback registration before capture begins.
+2. **Preview visibility was specified as behavior but not as an observable testable state**  
+   The design said that a preview should appear, but it did not define controller callbacks or UI state that prove:
+   - preview texture prepared,
+   - preview node attached to the scene,
+   - preview node visibility toggled correctly, and
+   - preview pose updated on each stable hit.
 
-3. **Delete semantics still contained a dead-state branch**  
-   Under the document’s own model, deleting a placed image does not clear `selectedImage`; therefore, the post-delete transition to `Idle` was no longer reachable and should not remain in the state machine.
+3. **The geometry/visibility contract was still too weak**  
+   The prior version did not fix the render pivot and anti-hidden-placement policy strongly enough. A quad could still be implemented with an unsuitable pivot or coplanar pose and remain visually absent or unreliable during placement.
 
-4. **Window-size change behavior during active recording was not explicit enough**  
-   The design locked portrait orientation and capped projection size, but it still did not state what happens if the AR activity enters split-screen, freeform resize, or another window-size change while recording is active. For a `MediaRecorder`-based implementation, dynamic surface resize handling is intentionally out of scope and needs an explicit stop policy.
+4. **The test design checked flow but not rendering truth**  
+   The tests covered file selection and button transitions, but they did not require proof that the preview and placed image were actually rendered in the AR scene. This allowed a false pass where state changed but nothing visible appeared.
 
-5. **Manifest/runtime AR support wording needed reconciliation**  
-   The manifest declares AR as required, which prevents normal Play distribution to unsupported devices. The runtime “unsupported device” handling still makes sense for sideload or externally installed cases, but the document needed to say that explicitly.
+5. **The recording requirement was internally inconsistent with the supported OS policy**  
+   The document still claimed an AR-screen-only recording requirement while keeping the feature available on Android 12L / 13 behavior. Official Android guidance states that app-window screen sharing is available starting in Android 14 QPR2, while MediaProjection otherwise captures the device display or an app window depending on platform support. Therefore, an AR-route-only guarantee cannot be truthfully promised on API 32/33 with this MediaProjection-based design. [R5][R13]
 
-6. **Foreground-service startup needed a runtime-type requirement, not only a manifest requirement**  
-   The document declared the `mediaProjection` service type in the manifest, but it did not explicitly require the implementation to pass the matching runtime foreground-service type when calling `startForeground()`.
+6. **The recording start contract proved consent, not successful capture**  
+   The prior version required consent, service startup, and recorder start, but it did not require evidence that capture had actually begun, resized to the true captured region when needed, and produced a valid file.
+
+7. **The design could not verify the user-selected capture target identity**  
+   On app-screen-sharing capable versions, MediaProjection provides resize and visibility callbacks for the captured content, but not an API that returns the identity of the chosen app window. The design therefore cannot strictly enforce 窶徼his app window窶・by code alone; it must combine pre-consent instruction, lifecycle constraints, and runtime callbacks to minimize wrong-target capture. [R5][R13]
 
 ### 2.2 Review Result
 
-The previous reviewed design was **close to implementation-ready**, but several clauses still permitted interpretation drift in recording lifecycle handling, AR session configuration, and state transitions. This version removes those remaining ambiguities.
+Version 1.5 was **not sufficient** as an implementation-ready detailed design for the stated product goal. The remaining gaps were behavioral and test-design defects, not editorial issues.
 
+### 2.3 Design Direction of This Revision
 
-### 2.3 Additional Corrections from Implementation Feedback
+This revision makes the following hard changes:
 
-The implementation attempt identified three additional gaps that must be fixed in this revision.
-
-1. **Selected-image visibility in AR space was still under-specified**  
-   The previous document described placement, but it did not explicitly require a visible in-AR preview/rendering path for the selected asset before and during placement. This allowed an implementation that accepted the file but failed to show the image in AR space.
-
-2. **The recording target needed to be constrained to the AR screen requirement**  
-   The previous document described MediaProjection behavior generically, but it did not state strongly enough that the product requirement is to record the AR screen experience of this app with microphone audio, rather than an arbitrary device-screen capture flow.
-
-3. **Upload format support was too narrow**  
-   The previous document allowed only PNG. The requirement is expanded to accept JPEG as well (`.jpg` and `.jpeg`) so that the file-upload flow matches common user assets.
-
----
+- add explicit render-asset preparation state and preview visibility state,
+- make **visible preview readiness** a precondition for **Place**,
+- disable AR depth usage for this feature to avoid unnecessary visibility ambiguity,
+- require controller-level observability for preview and placed node attachment and visibility,
+- align recording policy with platform-default MediaProjection behavior while preserving AR-route lifecycle ownership,
+- add capture-active and saved-file validation rules that reject empty or invalid output, and
+- expand the test plan so that rendering truth and recording truth are both verified.
 
 ## 3. Design Basis and External References
 
@@ -90,8 +138,8 @@ The design is based on the following technology assumptions and public reference
 - Placement of one PNG/JPEG image into AR space
 - Image scale, rotation, reposition, and delete operations
 - Session-scoped anchor management
-- AR screen recording with microphone audio
-- Error handling for invalid file selection, unavailable AR support, permission denial, and recording failure
+- AR-route-scoped screen recording with microphone audio using platform-default MediaProjection behavior
+- Error handling for invalid file selection, render preparation failure, unavailable AR support, permission denial, and recording failure
 
 ### 4.2 Out of Scope
 
@@ -102,6 +150,7 @@ The design is based on the following technology assumptions and public reference
 - User login or cloud sync
 - Image editing such as crop/filter/background removal
 - Cross-session restoration of image placement
+- Post-processing/editing of recorded video files
 
 ---
 
@@ -109,27 +158,38 @@ The design is based on the following technology assumptions and public reference
 
 ### 5.1 Supported Android Version
 
-To remove ambiguity from the original requirement, the supported OS policy is fixed as follows:
+The application runtime policy remains:
 
 - **minSdk = 32**
 - **compileSdk = latest stable SDK available at implementation time**
 - **targetSdk = latest stable SDK available at implementation time**
-- **Runtime compatibility promise = API 32 and above**
-- **Primary behavioral verification target = API 32 devices**
+- **Runtime compatibility promise for AR placement = API 32 and above**
 
-This means the application is intentionally scoped to Android API 32 and above at runtime, while the build target remains current.
+Recording policy in v7:
+
+- recording starts only from the AR route and follows AR route lifecycle constraints,
+- platform-default MediaProjection capture behavior is accepted,
+- API 32/33 full-display capture is acceptable,
+- Android 14+ app-window or full-display capture is acceptable depending on user choice,
+- recording remains available whenever AR screen is operational and `recordingState == Idle` (subject to permissions/consent flow).
 
 ### 5.2 Device Capability Requirements
 
-A device is considered supported only if all of the following are true:
+A device is considered supported for **AR placement** only if all of the following are true:
 
 - ARCore is supported by the device
 - Camera is available
 - Google Play Services for AR is installed or installable
-- The device can create a MediaProjection session
-- The device can grant microphone permission
 
-If any required AR capability is unavailable, the AR screen remains non-operational and presents a blocking message.
+A device is considered supported for recording if all of the following are true:
+
+- the AR placement requirements above are satisfied,
+- microphone permission can be granted,
+- a MediaProjection session can be created.
+
+If AR placement requirements are unavailable, the AR screen remains non-operational and presents a blocking message.
+
+If AR placement works but recording prerequisites are not yet met (permission/consent), the AR screen remains usable and the recording flow is retriable.
 
 Note:
 - because the manifest marks AR as required, normal Play-distributed installs should already be filtered to compatible devices,
@@ -167,9 +227,14 @@ Rationale:
 - An image must be selected before placement is allowed.
 - Placement is based on a **center-screen reticle**.
 - The reticle continuously follows a **stabilized** center hit result.
-- When a selected image exists and a stable valid hit exists, the application renders a live **placement preview** of the selected image in AR space at the candidate pose.
-- The preview uses the same aspect ratio, base size, and orientation rules as the final placed image.
-- The user confirms placement by pressing **Place**.
+- File acceptance alone is insufficient. Before placement can be enabled, the selected image must also reach **render-asset ready** state:
+  - bitmap decode/validation succeeded,
+  - texture upload succeeded,
+  - material instance creation succeeded, and
+  - preview node creation succeeded.
+- When a selected image exists, render-asset preparation has succeeded, and a stable valid hit exists, the application renders a live **placement preview** of the selected image in AR space at the candidate pose.
+- The preview uses the same aspect ratio, base size, pivot, and orientation rules as the final placed image.
+- **Place** is enabled only while the preview is confirmed visible.
 - Supported trackables:
   - horizontal up-facing planes
   - vertical planes
@@ -186,15 +251,16 @@ The selected image is rendered as a flat rectangular quad. PNG transparency is p
 
 At placement time:
 - the anchor position is taken from the current center hit,
-- the quad is positioned at the anchor,
+- the quad is positioned from a **bottom-center local pivot** so that the visible image stands on, rather than intersects through, the candidate pose,
 - the quad is made **upright in world space**,
-- the quad is rotated around the world Y axis so that its front initially faces the user.
+- the quad is rotated around the world Y axis so that its front initially faces the user,
+- the quad is offset slightly toward the user along the horizontal camera-to-anchor direction (**0.01 m**) to avoid coplanar hiding or z-fighting at the hit pose.
 
 Important clarification:
 - the image is **anchored by the hit position**, but it is **not forced to lie flush on the detected plane surface**,
 - even when placed using a vertical plane hit, the image remains an upright facing object rather than a wall-aligned poster.
 
-This behavior is selected because the requirement is “spatially fixed AR placement”, not “surface-stuck poster placement”.
+This behavior is selected because the requirement is 窶徭patially fixed AR placement窶・ not 窶徭urface-stuck poster placement窶・
 
 ### 6.5 Placement Count
 
@@ -236,21 +302,20 @@ Free single-finger drag is not used for repositioning because it is error-prone 
 
 ### 6.10 Recording Behavior
 
-Recording is available only on the AR screen.
+Recording is available only on the AR screen and is bound to AR route lifecycle.
 
 Recording captures:
-- the visual content of this app's **AR screen experience**,
+- platform-default MediaProjection capture result (full-display or app-window depending on OS/user choice),
 - microphone audio
 
 Product rule:
-- the intended recording target is the AR route of this application while it is foreground and visible,
-- the recording feature is not defined as a general-purpose device-screen recorder,
+- recording start is allowed only while the AR route is active and `RESUMED`,
 - leaving the AR route or losing the AR screen foreground state stops recording.
 
 Capture-scope rule:
-- on Android versions that support **app screen sharing**, the implementation uses the user-choice/app-screen-sharing path and instructs the user to select **this app window** so that the recorded video contains the AR screen content of this app,
-- the implementation does **not** opt out to forced default-display capture, because that would weaken the AR-screen-only requirement,
-- on Android 12L / 13, where practical behavior is full-display capture, recording is still started only from the AR screen and is automatically stopped when the app leaves the foreground, so the effective captured content remains the AR screen session.
+- API 32/33 full-display capture is acceptable,
+- Android 14+ app-window/full-display user choice is acceptable,
+- implementation does not capability-gate on app-window-sharing availability.
 
 Recording configuration:
 - container: **MP4**
@@ -267,8 +332,7 @@ Recording output:
 - file name pattern: `ar_recording_yyyyMMdd_HHmmss.mp4`
 
 Projection sizing rule:
-- derive the source bounds from **maximum window metrics**,
-- scale the portrait bounds to fit within the 1080 x 1920 cap while preserving aspect ratio,
+- derive the initial source bounds from **maximum window metrics**,
 - round the final width and height down to **even integers**,
 - if encoder compatibility issues are observed on target hardware, round down further to the nearest multiple of 16.
 
@@ -284,14 +348,27 @@ Important corrections:
 - incomplete files must be deleted if start-up fails,
 - MediaProjection consent data is **never cached** across sessions,
 - each recording session performs exactly one `getMediaProjection()` and one `createVirtualDisplay()` call for the consent grant that started that session,
-- recording start is allowed only while the AR screen is in the foreground `RESUMED` state.
+- recording start is allowed only while the AR screen is in the foreground `RESUMED` state,
+- recording start is considered successful only after the capture session reports active content (see Section 12.8),
+- recording finalization is considered successful only after saved-file validation confirms a usable MP4 (see Section 12.8).
 
 ### 6.11 File Picker Behavior
 
 - File selection uses `ActivityResultContracts.OpenDocument` with MIME filters `image/png` and `image/jpeg`. [R4]
 - Accepted filename extensions are `.png`, `.jpg`, and `.jpeg`.
 - The selected `Uri` is used only within the current session.
-- Persistable URI permission is not taken because the application does not restore image state across process death or future launches. [R8]
+- Load flow uses temporary read-permission guard semantics:
+  - if persistable read permission is available, it may be acquired and then explicitly released in `finally`,
+  - no URI permission is retained across app restarts or session restoration. [R8]
+- URI opening uses fallback sequence for provider compatibility:
+  - `openInputStream`
+  - `openAssetFileDescriptor`
+  - `openFileDescriptor`
+  - `openTypedAssetFileDescriptor` with MIME candidate fallback
+- Successful file selection must lead to one of two explicit outcomes only:
+  - **RenderAssetReady**
+  - **RenderAssetError**
+- Silent fallback to metadata-only success is prohibited.
 
 ### 6.12 Permission Strategy
 
@@ -319,7 +396,7 @@ Corrected enablement policy:
 
 - Plane finding mode: horizontal + vertical
 - Light estimation: disabled
-- Depth: automatic if supported, otherwise disabled
+- Depth: **disabled**
 - Instant placement: disabled
 - Cloud anchors: disabled
 - Update mode: latest camera image
@@ -328,9 +405,10 @@ Corrected enablement policy:
 Rationale:
 - the placed image uses an unlit material and does not consume AR lighting outputs,
 - disabling light estimation removes unnecessary per-frame work and avoids avoidable configuration risk,
+- this feature does not require AR depth for believable occlusion, but it does require reliable preview visibility,
+- disabling depth removes one more cause of hidden preview and placed content and simplifies validation,
 - ARCore guidance favors the default session focus mode for tracking performance,
-- `AUTO` focus is reserved for scenarios that specifically require it,
-- this app records the screen output rather than capturing camera stills/video through a custom camera pipeline, so forcing `AUTO` is not justified.
+- `AUTO` focus is reserved for scenarios that specifically require it.
 
 ### 6.14 Rendering Strategy
 
@@ -338,13 +416,17 @@ Rationale:
 - PNG transparency is preserved when present; JPEG is rendered without alpha
 - The material is **double-sided**
 - The image does not cast or receive shadows
+- The preview node and the placed node must each be explicit scene-graph objects owned by `ArSceneController`
 - A selected image with a valid stable hit must be visibly rendered as an AR placement preview before final placement is confirmed
+- Visibility is not inferred from state transitions alone; it is reported explicitly through controller-observable render state
+- A render failure must surface as `E-FILE-003` rather than silently falling back to invisible behavior
 
 ### 6.15 Error UX
 
 - Blocking conditions are shown as persistent inline panels
 - Non-blocking failures are shown through snackbars
 - System-owned dialogs are limited to runtime permissions and MediaProjection consent
+- Preview/render preparation failure is shown immediately after file selection and clears the **Place** action until corrected
 
 ### 6.16 AR Route Session Scope
 
@@ -390,16 +472,16 @@ The application uses a **layered MVVM architecture** with explicit controller bo
 
 ```text
 MainActivity
- └─ AppNavHost
-     ├─ StartScreen
-     └─ ArScreen
-         ├─ ArViewModel
-         ├─ ArSceneContainer
-         ├─ PermissionGateway
-         ├─ FilePickerGateway
-         ├─ PlacementCoordinator
-         ├─ RecordingCoordinator
-         └─ SnackbarHost
+ 笏披楳 AppNavHost
+     笏懌楳 StartScreen
+     笏披楳 ArScreen
+         笏懌楳 ArViewModel
+         笏懌楳 ArSceneContainer
+         笏懌楳 PermissionGateway
+         笏懌楳 FilePickerGateway
+         笏懌楳 PlacementCoordinator
+         笏懌楳 RecordingCoordinator
+         笏披楳 SnackbarHost
 ```
 
 ### 7.4 Package Structure
@@ -408,14 +490,10 @@ MainActivity
 com.example.arspatialpinning
 ├─ app
 │  ├─ MainActivity.kt
-│  ├─ App.kt
-│  └─ navigation
-│     ├─ AppNavHost.kt
-│     └─ Routes.kt
+│  └─ AppContainer.kt
 ├─ feature
 │  ├─ start
-│  │  ├─ StartScreen.kt
-│  │  └─ StartViewModel.kt
+│  │  └─ StartScreen.kt
 │  └─ ar
 │     ├─ ArScreen.kt
 │     ├─ ArViewModel.kt
@@ -427,14 +505,20 @@ com.example.arspatialpinning
 │        ├─ ArControls.kt
 │        ├─ BlockingPanel.kt
 │        ├─ ReticleOverlay.kt
-│        └─ RecordingOverlay.kt
+│        ├─ RecordingOverlay.kt
+│        └─ TransformGestureOverlay.kt
 ├─ domain
 │  ├─ model
 │  │  ├─ SelectedImage.kt
+│  │  ├─ PreparedRenderAsset.kt
 │  │  ├─ PlacementTransform.kt
 │  │  ├─ PlacedImageState.kt
 │  │  ├─ PlacementMode.kt
-│  │  └─ RecordingState.kt
+│  │  ├─ RenderAssetState.kt
+│  │  ├─ PreviewRenderState.kt
+│  │  ├─ RecordingState.kt
+│  │  ├─ HitTestUiModel.kt
+│  │  └─ DebugRenderStatus.kt
 │  └─ usecase
 │     ├─ LoadImageUseCase.kt
 │     ├─ PlaceImageUseCase.kt
@@ -452,16 +536,20 @@ com.example.arspatialpinning
 │  │  ├─ ArAvailabilityChecker.kt
 │  │  ├─ HitTestResult.kt
 │  │  ├─ PinnedImageNode.kt
-│  │  └─ TextureLoader.kt
+│  │  ├─ TextureLoader.kt
+│  │  └─ DebugRenderStatusTracker.kt
 │  ├─ media
 │  │  ├─ RecordingController.kt
 │  │  ├─ RecordingControllerImpl.kt
+│  │  ├─ RecordedFileValidator.kt
 │  │  ├─ RecordingService.kt
 │  │  ├─ RecordingNotificationFactory.kt
 │  │  └─ MediaStoreVideoWriter.kt
 │  └─ file
 │     ├─ ImageUriReader.kt
-│     └─ ImageValidator.kt
+│     ├─ ImageValidator.kt
+│     ├─ UriReadPermissionGuard.kt
+│     └─ UriStreamOpener.kt
 └─ common
    ├─ AppError.kt
    ├─ Result.kt
@@ -568,13 +656,13 @@ The top app bar back button is behaviorally identical to system back.
 | Button | Enabled When |
 |---|---|
 | Select Image | recording state is `Idle` |
-| Place | AR ready AND selected image exists AND valid center hit exists AND placement mode is `WaitingForPlacement` |
+| Place | AR ready AND selected image exists AND render asset state is `Ready` AND preview render state is `Visible` AND valid stable center hit exists AND placement mode is `WaitingForPlacement` |
 | Reposition | placed image exists AND placement mode is `Placed` |
 | Confirm Reposition | placement mode is `Repositioning` AND valid center hit exists |
 | Cancel | placement mode is `Repositioning` |
 | Delete | placed image exists |
 | Record | AR ready AND recording state is `Idle` |
-| Stop | recording state is `Recording` |
+| Stop | recording state is `Active` |
 
 ### 9.2.4 Visual States
 
@@ -590,16 +678,22 @@ The top app bar back button is behaviorally identical to system back.
 4. **No image selected**  
    AR feed visible, placement disabled.
 
-5. **Image selected, waiting for valid hit**  
-   Center reticle shown with surface detection guidance. When a stable valid hit exists, a visible preview of the selected image is shown in AR space at the candidate placement pose.
+5. **Image selected, render preparing**  
+   Center reticle may be shown, but **Place** remains disabled until render-asset preparation succeeds.
 
-6. **Placed**  
+6. **Image selected, waiting for valid hit**  
+   Center reticle shown with surface detection guidance. When a stable valid hit exists and the render asset is ready, a visible preview of the selected image is shown in AR space at the candidate placement pose.
+
+7. **Placed**  
    Transform gestures enabled. Temporary AR tracking loss does not clear placement state; the image remains logically placed and resumes normal rendering when tracking recovers.
 
-7. **Repositioning**  
+8. **Repositioning**  
    Existing image alpha = 50%. Reticle active. Transform gestures disabled.
 
-8. **Recording active**  
+9. **Recording preparing/finalizing**  
+   Record is disabled while recording state is `Preparing` or `Finalizing`. `Select Image` is disabled while recording is `Preparing`, `Active`, or `Finalizing`.
+
+10. **Recording active**  
    Red badge and elapsed timer shown.
 
 ---
@@ -613,14 +707,16 @@ data class ArUiState(
     val hasCameraPermission: Boolean = false,
     val hasRecordAudioPermission: Boolean = false,
     val arAvailability: ArAvailability = ArAvailability.Unknown,
-    val isArInstallRequired: Boolean = false,
     val isArReady: Boolean = false,
     val isCameraTracking: Boolean = false,
     val selectedImage: SelectedImage? = null,
+    val renderAssetState: RenderAssetState = RenderAssetState.None,
+    val previewRenderState: PreviewRenderState = PreviewRenderState.HiddenNoSelection,
     val placedImage: PlacedImageState? = null,
-    val placementMode: PlacementMode = PlacementMode.Idle,
-    val currentHit: HitTestUiModel? = null,
+    val placementMode: PlacementMode = PlacementMode.WaitingForPlacement,
+    val currentHit: HitTestUiModel = HitTestUiModel(),
     val recordingState: RecordingState = RecordingState.Idle,
+    val debugRenderStatus: DebugRenderStatus = DebugRenderStatus(),
     val blockingMessage: String? = null,
     val transientMessage: String? = null
 )
@@ -638,84 +734,96 @@ enum class ArAvailability {
 ```
 
 ```kotlin
-data class HitTestUiModel(
-    val isValid: Boolean,
-    val distanceMeters: Float,
-    val planeType: PlaneType,
-    val isStable: Boolean
-)
-
-enum class PlaneType {
-    HorizontalUpFacing,
-    Vertical
+sealed interface RenderAssetState {
+    data object None : RenderAssetState
+    data object Preparing : RenderAssetState
+    data class Ready(val asset: PreparedRenderAsset) : RenderAssetState
+    data class Error(val reason: String) : RenderAssetState
 }
 ```
 
 ```kotlin
-sealed interface PlacementMode {
-    data object Idle : PlacementMode
-    data object WaitingForPlacement : PlacementMode
-    data object Placed : PlacementMode
-    data object Repositioning : PlacementMode
+sealed interface PreviewRenderState {
+    data object HiddenNoSelection : PreviewRenderState
+    data object HiddenPreparing : PreviewRenderState
+    data object HiddenNoTracking : PreviewRenderState
+    data object HiddenNoStableHit : PreviewRenderState
+    data object Visible : PreviewRenderState
+    data class Error(val reason: String) : PreviewRenderState
 }
 ```
 
+```kotlin
+sealed interface RecordingState {
+    data object Idle : RecordingState
+    data object Preparing : RecordingState
+    data class Active(val startedAtMillis: Long) : RecordingState
+    data object Finalizing : RecordingState
+    data class Failed(val message: String) : RecordingState
+
+    val blocksImageSelection: Boolean
+        get() = this is Preparing || this is Active || this is Finalizing
+}
+```
+
+```kotlin
+data class HitTestUiModel(
+    val hasValidHit: Boolean = false,
+    val stabilizationFrames: Int = 0,
+    val hasStableHit: Boolean = false,
+    val trackableId: String? = null
+)
+```
+
+```kotlin
+enum class PlacementMode {
+    WaitingForPlacement,
+    Placed,
+    Repositioning
+}
+```
 
 ### 10.2 Placement Mode State Machine
 
 ```text
-Idle
- ├─(image selected)──────────────> WaitingForPlacement
- └─(selection cleared)─────────> Idle
-
 WaitingForPlacement
- ├─(valid hit + Place)─────────> Placed
- ├─(replace image)───────────────> WaitingForPlacement
- ├─(selection cleared)─────────> Idle
- ├─(delete selected asset)─────> Idle
- └─(AR route exit)──────────────> Idle
+ -> (renderAssetReady + previewVisible + stableHit + Place) -> Placed
+ -> (replace image) -> WaitingForPlacement
+ -> (render/preview error) -> WaitingForPlacement
 
 Placed
- ├─(Reposition tapped)─────────> Repositioning
- ├─(Delete tapped)─────────────> WaitingForPlacement
- ├─(replace image)───────────────> WaitingForPlacement
- ├─(temporary tracking loss)───> Placed
- ├─(controller/session destroyed)→ WaitingForPlacement
- └─(AR route exit)──────────────> Idle
+ -> (Reposition tapped) -> Repositioning
+ -> (Delete tapped) -> WaitingForPlacement
+ -> (replace image) -> WaitingForPlacement
+ -> (temporary tracking loss) -> Placed
 
 Repositioning
- ├─(valid hit + Confirm)───────> Placed
- ├─(Cancel)────────────────────> Placed
- ├─(temporary tracking loss)───> Repositioning
- ├─(Delete tapped)─────────────> WaitingForPlacement
- ├─(replace image)───────────────> WaitingForPlacement
- └─(AR route exit)──────────────> Idle
+ -> (valid stable hit + Confirm) -> Placed
+ -> (Cancel) -> Placed
+ -> (Delete tapped) -> WaitingForPlacement
+ -> (replace image) -> WaitingForPlacement
 ```
 
 ### 10.3 Recording State Machine
 
 ```text
 Idle
- └─(Record tapped)─────────────> RequestingPermissionOrConsent
-RequestingPermissionOrConsent
- ├─(permission/consent OK)─────> Preparing
- ├─(user denied)───────────────> Idle
- └─(error)─────────────────────> Error
-Preparing
- ├─(start success)─────────────> Recording
- └─(start fail)────────────────> Error
-Recording
- ├─(Stop tapped)───────────────> Finalizing
- ├─(10 min elapsed)────────────> Finalizing
- ├─(screen exit)───────────────> Finalizing
- └─(fatal recorder event)──────> Error
-Finalizing
- ├─(success)───────────────────> Idle
- └─(failure)───────────────────> Error
-Error
- └─(message delivered)─────────> Idle
-```
+ -> (Record tapped; permission+consent flow starts) -> Preparing
 
+Preparing
+ -> (start success) -> Active
+ -> (start failure / consent denied) -> Failed
+
+Active
+ -> (Stop tapped / 10 min / projection onStop / route exit / fatal error / window-size change) -> Finalizing
+
+Finalizing
+ -> (finalize success + file validation success) -> Idle
+ -> (finalize failure) -> Failed
+
+Failed
+ -> (message consumed or retry path) -> Idle
+```
 ---
 
 ## 11. Domain Model
@@ -725,47 +833,72 @@ Error
 ```kotlin
 data class SelectedImage(
     val uri: Uri,
-    val mimeType: String,
-    val widthPx: Int,
-    val heightPx: Int,
-    val aspectRatio: Float,
-    val displayName: String
+    val bitmap: Bitmap,
+    val format: ImageFormat
 )
+
+enum class ImageFormat {
+    Png,
+    Jpeg
+}
 ```
 
-### 11.2 PlacementTransform
+### 11.2 PreparedRenderAsset
 
 ```kotlin
-data class PlacementTransform(
-    val scale: Float,
-    val rotationYDeg: Float,
-    val baseHeightMeters: Float,
+data class PreparedRenderAsset(
+    val widthMeters: Float,
+    val heightMeters: Float,
     val aspectRatio: Float
 )
 ```
 
-### 11.3 PlacedImageState
+### 11.3 PlacementTransform
 
 ```kotlin
-data class PlacedImageState(
-    val selectedImage: SelectedImage,
-    val transform: PlacementTransform,
-    val isPreviewGhost: Boolean = false
+data class PlacementTransform(
+    val scale: Float = 1f,
+    val rotationYDegrees: Float = 0f
 )
 ```
 
-### 11.4 RecordingState
+### 11.4 PlacedImageState
+
+```kotlin
+data class PlacedImageState(
+    val anchorId: String,
+    val widthMeters: Float,
+    val heightMeters: Float,
+    val transform: PlacementTransform = PlacementTransform()
+)
+```
+
+### 11.5 RecordingState
 
 ```kotlin
 sealed interface RecordingState {
     data object Idle : RecordingState
-    data object RequestingPermissionOrConsent : RecordingState
     data object Preparing : RecordingState
-    data class Recording(val startedAtMillis: Long, val outputUri: Uri) : RecordingState
+    data class Active(val startedAtMillis: Long) : RecordingState
     data object Finalizing : RecordingState
-    data class Error(val reason: String) : RecordingState
+    data class Failed(val message: String) : RecordingState
 }
 ```
+
+### 11.6 DebugRenderStatus
+
+```kotlin
+data class DebugRenderStatus(
+    val previewNodeExists: Boolean = false,
+    val previewNodeAttached: Boolean = false,
+    val previewNodeVisible: Boolean = false,
+    val placedNodeExists: Boolean = false,
+    val placedNodeAttached: Boolean = false,
+    val previewPoseUpdateFrameCount: Long = 0L
+)
+```
+
+This type exists to make render truth observable in tests and logs without exposing raw SceneView or ARCore objects outside the controller boundary.
 
 ---
 
@@ -834,6 +967,9 @@ User taps **Select Image**.
 - Bounds decode runs first.
 - Full decode runs only if the asset passes validation and memory constraints.
 - The validated bitmap/texture is prepared once and reused for placement preview and final placement; the image stream must not be re-decoded on every frame or re-picked at place time.
+- After validation, the controller must immediately enter one of the following terminal preparation outcomes:
+  - `RenderAssetState.Ready`
+  - `RenderAssetState.Error`
 
 ### 12.2.3 Validation Rules
 
@@ -843,6 +979,8 @@ The selected asset is accepted only if all checks pass:
 - Width and height are greater than zero
 - ContentResolver can open the stream
 - Decoded size stays within memory budget after sampling
+- texture upload succeeds
+- preview node creation succeeds
 
 ### 12.2.4 Memory Budget Rule
 
@@ -857,15 +995,23 @@ If an image is already placed when a new image is selected:
 2. release old anchor,
 3. clear old transform,
 4. set new image as active selection,
-5. enter `WaitingForPlacement`.
+5. prepare the new render asset immediately,
+6. enter `WaitingForPlacement`.
 
----
+### 12.2.6 Failure Rule
+
+If decode, texture upload, material creation, or preview node creation fails:
+- `renderAssetState = Error`,
+- `previewRenderState = Error`,
+- **Place** remains disabled,
+- show `E-FILE-003`,
+- do not keep a metadata-only 窶徭uccessful selection窶・state.
 
 ## 12.3 Scene Initialization and Frame Loop
 
 ### 12.3.1 SceneView Integration
 
-`ArSceneContainer` hosts SceneView and exposes an `ArSceneController` interface to the ViewModel layer. SceneView is the only component allowed to directly own renderable/node/anchor objects. [R2]
+`ArSceneContainer` hosts SceneView and exposes an `ArSceneController` interface to the ViewModel layer. SceneView is the only component allowed to directly own renderable, node, preview-node, and anchor objects. [R2]
 
 ### 12.3.2 Session Config
 
@@ -874,10 +1020,7 @@ session.configure(
     session.config.apply {
         planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
         lightEstimationMode = Config.LightEstimationMode.DISABLED
-        depthMode = when {
-            session.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
-            else -> Config.DepthMode.DISABLED
-        }
+        depthMode = Config.DepthMode.DISABLED
         instantPlacementMode = Config.InstantPlacementMode.DISABLED
         cloudAnchorMode = Config.CloudAnchorMode.DISABLED
         // Keep the default focus mode from the session config.
@@ -895,9 +1038,12 @@ On each AR frame:
 2. perform a center-screen hit test,
 3. choose the nearest valid hit on a supported plane,
 4. apply the hit stabilization rule,
-5. update or hide the live placement preview for the selected image,
-6. publish hit state to the ViewModel,
-7. update reticle validity.
+5. if `renderAssetState == Ready` and no preview node exists, create/attach the preview node immediately,
+6. update the preview node pose, visibility, and facing when a stable valid hit exists,
+7. hide the preview node when no stable valid hit exists or tracking is lost,
+8. publish hit state to the ViewModel,
+9. publish preview render state and debug render status to the ViewModel,
+10. update reticle validity.
 
 If camera tracking is temporarily lost, the controller clears only the current valid hit/reticle state and hides the placement preview. It does **not** delete the placed node or reset placement mode.
 
@@ -909,7 +1055,15 @@ A hit is valid only if:
 - plane tracking state is valid,
 - camera tracking state is `TRACKING`.
 
----
+### 12.3.5 Preview Observability Rule
+
+The controller must make the following observable for tests and diagnostics:
+
+- whether the preview node is attached to the scene,
+- whether the preview node is currently visible,
+- the last frame on which the preview pose was updated.
+
+These signals are mandatory because preview truth must be testable without depending on visual human inspection alone.
 
 ## 12.4 Placement Flow
 
@@ -918,20 +1072,24 @@ A hit is valid only if:
 - camera permission granted
 - AR ready
 - selected image exists
-- selected image renderable/texture preparation succeeded
+- `renderAssetState == Ready`
+- `previewRenderState == Visible`
+- preview node is attached
 - valid hit exists
 - placement mode is `WaitingForPlacement`
 
 ### 12.4.2 Procedure
 
-1. Confirm that the prepared preview/renderable for the selected image exists.
+1. Confirm that the prepared preview/renderable for the selected image exists and is scene-attached.
 2. Create ARCore anchor from the current hit.
-3. Build rectangular quad geometry from aspect ratio.
+3. Build rectangular quad geometry from aspect ratio using a bottom-center pivot.
 4. Reuse the already prepared texture/material state for the selected image, or clone from the prepared preview node without reopening the image stream.
-5. Create the placed node and attach it to the anchor.
-6. Apply default scale and rotation.
-7. Hide the placement preview node.
-8. Set placement mode to `Placed`.
+5. Apply the same upright orientation and the same anti-coplanar forward offset used by the preview.
+6. Create the placed node and attach it to the anchor.
+7. Apply default scale and rotation.
+8. Hide the placement preview node.
+9. Publish placed-node render status within the next frame.
+10. Set placement mode to `Placed`.
 
 ### 12.4.3 Size Formula
 
@@ -949,7 +1107,14 @@ Then:
 - Delete, replace, and confirm reposition always release the old anchor
 - Anchors are never serialized
 
----
+### 12.4.5 Placement Success Rule
+
+Placement success is not defined only by the absence of an exception. It additionally requires:
+- placed node attached to the scene,
+- placed node transform applied successfully,
+- no render error reported for that node in the next frame.
+
+If any of these checks fail, the controller must surface `E-FILE-003` or a placement error and revert to `WaitingForPlacement`.
 
 ## 12.5 Transform Flow
 
@@ -1061,16 +1226,17 @@ User taps **Record**.
 - `MediaProjection` for virtual display [R5]
 - `MediaRecorder` for MP4 encoding [R6]
 - `RecordingService` foreground service for Android 14+ mediaProjection compliance [R10]
+- `RecordedFileValidator` for post-save validation
 
 ### 12.8.4 Recording Target Policy
 
-The product requirement is to record the AR screen of this app with microphone audio.
+The product requirement is to start recording from the AR route and keep recording lifecycle tied to that route.
 
 Policy:
 - the recording flow is initiated only from the AR route,
 - the recorded session is tied to the AR route lifecycle,
-- on platform versions that support app screen sharing, the consent UX must instruct the user to select **this app window**,
-- the implementation must not deliberately force default-display-only capture for this feature,
+- API 32/33 full-display capture is acceptable,
+- Android 14+ app-window/full-display selection is acceptable,
 - if the AR route is no longer foreground, recording is stopped and finalized.
 
 ### 12.8.5 Start Procedure
@@ -1078,7 +1244,7 @@ Policy:
 Corrected order:
 
 1. If microphone permission is missing, request it.
-2. If permission is granted, launch MediaProjection consent from the AR screen.
+2. Launch MediaProjection consent from the AR screen.
 3. If consent is granted:
    - start `RecordingService`,
    - call `ServiceCompat.startForeground(..., FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)` from the service before capture begins,
@@ -1087,8 +1253,7 @@ Corrected order:
    - obtain `MediaProjection`,
    - register `MediaProjection.Callback` **before** calling `createVirtualDisplay()`,
    - create exactly one `VirtualDisplay` for this session using the recorder surface,
-   - start `MediaRecorder`,
-   - enter `Recording`.
+   - start `MediaRecorder` and transition to active recording state.
 4. The consent intent/result pair and the resulting `MediaProjection` instance are single-session objects and must not be cached or reused.
 5. If any step fails:
    - release partial resources,
@@ -1115,11 +1280,11 @@ mediaRecorder.apply {
 
 ### 12.8.7 Stop Serialization Rule
 
-The recording controller owns a single-threaded critical section for start/stop/failure transitions.
+The recording controller owns a single-threaded critical section for start, stop, and failure transitions.
 
 Rules:
 - only one stop path may run,
-- `OnStopRecordClick`, route exit, timeout, and `MediaProjection.Callback.onStop()` all delegate to the same idempotent stop function,
+- `OnStopRecordClick`, route exit, timeout, `MediaProjection.Callback.onStop()`, and captured-content-invisible auto-stop all delegate to the same idempotent stop function,
 - repeated stop requests after the first are ignored,
 - no new recording may start until cleanup has fully completed.
 
@@ -1131,9 +1296,16 @@ Rules:
 4. Release `VirtualDisplay`.
 5. Stop `MediaProjection`.
 6. Finalize MediaStore entry by setting `IS_PENDING = 0`.
-7. Stop `RecordingService`.
-8. Emit success snackbar.
-9. Return to `Idle`.
+7. Run `RecordedFileValidator` against the saved `Uri`.
+8. Validation succeeds only if all checks pass:
+   - file exists and can be opened,
+   - file size is greater than zero,
+   - MP4 contains a video track,
+   - MP4 contains an audio track,
+   - duration is greater than a minimum validity threshold.
+9. Stop `RecordingService`.
+10. Emit success snackbar only after validation success.
+11. Return to `Idle`.
 
 ### 12.8.9 Stop Failure Rule
 
@@ -1141,7 +1313,7 @@ Rules:
 
 Behavior:
 - if stop fails, the controller attempts cleanup,
-- the incomplete file is deleted,
+- the incomplete or invalid file is deleted,
 - the foreground service is stopped,
 - user sees a failure message,
 - state returns through `Error` to `Idle`.
@@ -1154,7 +1326,7 @@ Recording stops automatically when:
 - fatal recorder error occurs
 - user leaves the AR screen
 - app reaches `onStop()` while the AR route is no longer foreground
-- AR window size changes during active recording (for example split-screen/freeform resize)
+- configuration/window-size change while recording is active
 
 ### 12.8.11 Recording Interaction Policy
 
@@ -1163,7 +1335,6 @@ During active recording:
 - back navigation requests recording stop first,
 - transform gestures remain enabled,
 - reposition and delete remain allowed,
-- entering multi-window / freeform resize is unsupported; if a window-size change is observed, recording stops defensively,
 - if the user navigates away after stop is requested, navigation completes only after cleanup finishes.
 
 ## 12.9 Permission Flow
@@ -1191,8 +1362,11 @@ During active recording:
 - Notification permission is not treated as a blocker for recording start [R11]
 - If denied, recording still proceeds, but the user may not see the foreground-service notice in the notification drawer on Android 13+ [R11]
 
+### 12.9.5 Recording Availability Resolution
 
----
+- On AR screen entry, evaluate AR readiness and permission state
+- Recording availability is determined by `isArReady` and `recordingState`
+- Recording flow failures are surfaced as explicit record-start/record-stop errors
 
 ## 13. UI Event Contract
 
@@ -1200,6 +1374,8 @@ During active recording:
 sealed interface ArUiEvent {
     data object OnSelectImageClick : ArUiEvent
     data class OnImageSelected(val uri: Uri?) : ArUiEvent
+    data class OnRenderAssetPrepared(val asset: PreparedRenderAsset) : ArUiEvent
+    data class OnRenderAssetFailed(val reason: String) : ArUiEvent
     data object OnPlaceClick : ArUiEvent
     data object OnRepositionClick : ArUiEvent
     data object OnConfirmRepositionClick : ArUiEvent
@@ -1210,6 +1386,7 @@ sealed interface ArUiEvent {
     data object OnRecordClick : ArUiEvent
     data object OnStopRecordClick : ArUiEvent
     data class OnFrameHitUpdated(val hit: HitTestUiModel?) : ArUiEvent
+    data class OnPreviewRenderStateChanged(val state: PreviewRenderState) : ArUiEvent
     data class OnArAvailabilityResolved(
         val availability: ArAvailability,
         val installRequired: Boolean
@@ -1219,27 +1396,27 @@ sealed interface ArUiEvent {
 }
 ```
 
----
-
 ## 14. Platform Interface Design
 
 ## 14.1 ArSceneController
 
 ```kotlin
 interface ArSceneController {
-    fun initialize()
-    fun resume()
-    fun pause()
-    fun release()
-    fun updateSelectedImage(image: SelectedImage?)
-    fun placeCurrentImage(hit: HitTestResult): Result<Unit>
-    fun updateScale(scale: Float)
-    fun updateRotationY(degrees: Float)
-    fun beginRepositionPreview()
-    fun confirmReposition(hit: HitTestResult): Result<Unit>
-    fun cancelRepositionPreview()
-    fun deletePinnedImage()
-    fun observeHitTests(onChanged: (HitTestResult?) -> Unit)
+    fun bindScene(engine: Engine, childNodes: MutableList<Node>)
+    fun prepareSelectedImage(selectedImage: SelectedImage): AppResult<PreparedRenderAsset>
+    fun processFrame(
+        frame: Frame,
+        viewportWidthPx: Int,
+        viewportHeightPx: Int,
+        placementMode: PlacementMode
+    ): FrameProcessingResult
+    fun placeImage(session: Session, selectedImage: SelectedImage): AppResult<PlacedImageState>
+    fun enterRepositionMode()
+    fun confirmReposition(session: Session): AppResult<PlacedImageState>
+    fun cancelReposition()
+    fun applyTransform(scale: Float, rotationYDegrees: Float)
+    fun deleteImage()
+    fun clear()
 }
 ```
 
@@ -1250,6 +1427,7 @@ interface ArSceneController {
 - load and release textures/materials
 - apply transforms
 - bridge frame hit data to ViewModel
+- expose preview and placed render truth for tests and diagnostics
 
 Anchor objects are controller-private. No ARCore anchor identifier is exposed through domain state.
 
@@ -1257,18 +1435,15 @@ Anchor objects are controller-private. No ARCore anchor identifier is exposed th
 
 ```kotlin
 interface RecordingController {
-    suspend fun startRecording(consentResultCode: Int, consentData: Intent?): Result<Uri>
-    suspend fun stopRecording(reason: StopReason = StopReason.User): Result<Uri>
+    var onProjectionStopped: (() -> Unit)?
+    fun createConsentIntent(): Intent
+    suspend fun startRecording(
+        consentResultCode: Int,
+        consentData: Intent,
+        maximumWindowBounds: Rect
+    ): AppResult<Unit>
+    suspend fun stopRecording(): AppResult<Unit>
     fun release()
-}
-
-enum class StopReason {
-    User,
-    RouteExit,
-    ProjectionStopped,
-    Timeout,
-    ConfigurationChanged,
-    FatalError
 }
 ```
 
@@ -1279,10 +1454,9 @@ enum class StopReason {
 - configure and release MediaProjection and VirtualDisplay
 - serialize start/stop transitions
 - handle timeout and error cleanup
+- validate recorded output before reporting success
 - stop the foreground service after cleanup
-- delete incomplete files on failure
-
----
+- delete incomplete or invalid files on failure
 
 ## 15. Compose Implementation Design
 
@@ -1419,8 +1593,7 @@ Selected image document permissions are not persisted across app restarts by des
 - suspend SceneView-related active resources as required
 
 ### onWindowMetricsChanged / configuration-affecting resize
-- if a window-size change is observed while recording is active, request defensive stop with reason `ConfigurationChanged`
-- do not attempt live `MediaRecorder` surface reconfiguration in this application
+- if a window-size or configuration-affecting change is observed while recording is active, stop recording defensively and finalize safely
 
 ### onDestroy
 - release SceneView-bound resources
@@ -1476,14 +1649,15 @@ Additional rule:
 | E-AR-002 | Camera permission denied | Camera permission is required to start AR. | Retry permission |
 | E-AR-003 | ARCore install/update required but not completed | AR components are not ready. | Retry install/update |
 | E-FILE-001 | Invalid image | The selected file is not a valid PNG or JPEG image. | Select another file |
-| E-FILE-003 | Preview/render creation failed | The selected image could not be rendered in AR space. | Select another file or retry |
 | E-FILE-002 | File open failed | The image could not be opened. | Re-pick file |
+| E-FILE-003 | Preview/render creation failed | The selected image could not be rendered in AR space. | Select another file or retry |
 | E-PLACEMENT-001 | No valid plane | Move the device to detect a surface. | Continue scanning |
 | E-REC-001 | Microphone permission denied | Microphone permission is required for recording. | Retry permission |
 | E-REC-002 | MediaProjection denied | Screen capture permission was not granted. | Retry recording |
 | E-REC-003 | Recorder start failed | Recording could not be started. | Retry recording |
 | E-REC-004 | Recorder stopped unexpectedly | Recording ended unexpectedly. | Retry recording |
 | E-REC-005 | Recorder stop failed | Recording could not be finalized. | Retry recording |
+| E-REC-007 | Recorded file invalid | The recording was saved but is not a valid AR recording file. | Retry recording |
 | E-STORAGE-001 | Output creation failed | Video file could not be created. | Free storage and retry |
 
 ## 20.2 Logging Policy
@@ -1522,6 +1696,7 @@ Additional rule:
 
 - activity `screenOrientation="portrait"`
 - hardware acceleration enabled
+- activity remains resizable to comply with MediaProjection behavior on supported large-screen/windowed environments [R5]
 - keep-screen-on policy applied while the AR screen is visible
 - recording service runs only during an active recording session
 - the service must call `startForeground()` with `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` at runtime
@@ -1579,7 +1754,7 @@ Constraint:
 - all platform resources are released on screen exit
 - failed recordings must not leave pending MediaStore items
 - replacing an image must not leak anchors or renderables
-- window-size changes during recording must trigger a safe stop rather than surface reconfiguration
+- window-size/configuration changes during recording trigger defensive stop and cleanup
 
 ### 23.4 Security and Privacy
 
@@ -1629,13 +1804,13 @@ Activity -> RecordingController: startRecording(resultCode, data)
 RecordingController -> RecordingService: start foreground notification
 RecordingController -> MediaStore: create MP4 item
 RecordingController -> MediaRecorder: prepare
-RecordingController -> MediaProjection: create virtual display for the AR screen session
-RecordingController -> MediaRecorder: start
+RecordingController -> MediaProjection: create virtual display
 UI State -> Recording
 ...
 User -> UI: Tap Stop
 UI -> RecordingController: stopRecording()
 RecordingController -> MediaStore: finalize file
+RecordingController -> RecordedFileValidator: verify MP4 contains valid audio/video
 RecordingController -> RecordingService: stop
 UI -> Snackbar: recording saved
 ```
@@ -1648,11 +1823,14 @@ UI -> Snackbar: recording saved
 
 - PNG/JPEG signature validation
 - MIME/header fallback logic
+- render-asset state transitions
+- preview-state transitions
 - scale clamp logic
 - rotation normalization logic
 - placement mode transitions
 - recording state transitions
 - output filename generation
+- recorded-file validation rules
 
 ## 25.2 Instrumentation Test Targets
 
@@ -1660,12 +1838,26 @@ UI -> Snackbar: recording saved
 - camera permission denial UI
 - microphone permission request flow
 - PNG/JPEG selection success/failure
-- preview visibility after valid hit
-- button enablement by placement mode
+- render-asset error surfaces as `E-FILE-003`
+- **Place** remains disabled until `renderAssetState == Ready` and `previewRenderState == Visible`
+- preview visibility after stable valid hit
+- preview state change when tracking is lost
+- button enablement by placement mode and recording state
 - reposition mode button swap
 - delete behavior
 
-## 25.3 Manual Device Test Targets
+## 25.3 Controller Integration / Debug-State Test Targets
+
+Because visual AR truth cannot be covered adequately by UI-only tests, the controller must expose debug render status and the following must be verified:
+
+- after successful image preparation, preview node is attached,
+- after stable valid hit, preview node becomes visible,
+- preview pose update frame counter advances while hit remains stable,
+- after placement, placed node is attached and preview node is hidden,
+- after delete, placed node is detached,
+- no metadata-only success path exists after render failure.
+
+## 25.4 Manual Device Test Targets
 
 - ARCore availability/install path
 - `UNKNOWN_CHECKING` warm-up behavior
@@ -1673,14 +1865,15 @@ UI -> Snackbar: recording saved
 - placement stability and anti-jitter behavior
 - transient tracking loss without placement reset
 - transform gesture usability
-- recording of the AR screen with microphone audio
+- selected image becomes visibly previewed in AR before **Place** is enabled
+- placed image remains visible after placement and after reposition
+- recording of the AR screen flow with microphone audio from AR route
 - recording interruption and stop failure handling
+- recorded file contains both video and audio tracks and opens successfully
 - one-consent-per-recording-session behavior on Android 14+
-- split-screen or window-size change behavior during recording
+- window/configuration change triggers safe stop while recording
 - back navigation while recording
 - process death behavior without restore
-
----
 
 ## 26. Acceptance Mapping
 
@@ -1692,14 +1885,15 @@ UI -> Snackbar: recording saved
 | SceneView usage | Sections 3, 12.3 |
 | Jetpack Compose UI | Sections 3, 15 |
 | File picker PNG/JPEG selection | Sections 6.11, 12.2 |
+| Visible AR preview before placement | Sections 6.3, 6.14, 10, 12.2 to 12.4, 25 |
 | Scale / rotate / reposition / delete | Sections 12.5 to 12.7 |
 | Single image only | Sections 6.5, 12.2.5 |
 | Session-only save | Sections 6.9, 17.1 |
 | No world anchor persistence | Sections 6.9, 12.4.4 |
+| Recording lifecycle robustness | Sections 5, 6.10, 12.8, 12.9 |
 | Audio recording | Sections 6.10, 12.8 |
-| Android API 32 support | Sections 5, 21, 22 |
-
----
+| Recorded file validity verification | Sections 12.8, 25 |
+| Android API 32 support for AR placement | Sections 5, 21, 22 |
 
 ## 27. Implementation Notes
 
@@ -1733,11 +1927,12 @@ UI -> Snackbar: recording saved
 
 ## 28. Final Design Statement
 
-This revised version is materially stronger than the previous draft because it now makes selected-image visibility in AR space mandatory, constrains the recording requirement to the AR screen experience of this app, expands upload support to PNG/JPEG, tightens MediaProjection single-session rules, and keeps the existing lifecycle and cleanup guarantees.
+This revised version is materially stronger than version 1.5 because it no longer treats image selection as equivalent to render success, no longer leaves preview visibility untestable, and no longer reports recording success without validating the saved file.
 
-The document is now suitable as a baseline detailed design for implementation.
+The design is now suitable as a baseline detailed design for implementation **with one explicit constraint**:
 
----
+- AR placement/manipulation remains supported on API 32 and above.
+- Recording starts from the AR route and follows AR-route lifecycle constraints, while platform-default MediaProjection capture behavior is accepted.
 
 ## References
 
@@ -1754,3 +1949,5 @@ The document is now suitable as a baseline detailed design for implementation.
 - **[R11]** Notification runtime permission / FGS notification behavior: https://developer.android.com/develop/ui/views/notifications/notification-permission
 - **[R12]** ARCore `Config.FocusMode` guidance: https://developers.google.com/ar/reference/java/com/google/ar/core/Config.FocusMode
 - **[R13]** Android app screen sharing overview: https://developer.android.com/about/versions/14/features/app-screen-sharing
+
+
