@@ -10,9 +10,13 @@ import androidx.lifecycle.viewModelScope
 import com.example.arspatialpinning.app.AppContainer
 import com.example.arspatialpinning.common.AppError
 import com.example.arspatialpinning.common.AppResult
+import com.example.arspatialpinning.domain.model.ArAvailability
+import com.example.arspatialpinning.domain.model.DebugRenderStatus
 import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.domain.model.PlacementTransform
+import com.example.arspatialpinning.domain.model.PreviewRenderState
 import com.example.arspatialpinning.domain.model.RecordingState
+import com.example.arspatialpinning.domain.model.RenderAssetState
 import com.example.arspatialpinning.domain.usecase.ConfirmRepositionUseCase
 import com.example.arspatialpinning.domain.usecase.DeleteImageUseCase
 import com.example.arspatialpinning.domain.usecase.EnterRepositionModeUseCase
@@ -24,10 +28,8 @@ import com.example.arspatialpinning.domain.usecase.StartRecordingUseCase
 import com.example.arspatialpinning.domain.usecase.StopRecordingUseCase
 import com.example.arspatialpinning.platform.ar.ArAvailabilityChecker
 import com.example.arspatialpinning.platform.ar.ArSceneController
-import com.example.arspatialpinning.platform.ar.HitTestResult
 import com.example.arspatialpinning.platform.media.RecordingController
 import com.google.ar.core.Frame
-import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.android.filament.Engine
 import io.github.sceneview.node.Node
@@ -39,7 +41,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlin.math.abs
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class ArViewModel(
     private val loadImageUseCase: LoadImageUseCase,
@@ -63,19 +66,17 @@ class ArViewModel(
     val sideEffects: SharedFlow<ArSideEffect> = _sideEffects.asSharedFlow()
 
     private var currentSession: Session? = null
-    private var stabilizedHit: HitTestResult? = null
-    private var candidateTrackableId: String? = null
-    private var candidatePose: Pose? = null
-    private var stabilizationFrames: Int = 0
     private var maximumWindowBounds: Rect = Rect(0, 0, 1080, 1920)
     private var isArRouteActive: Boolean = true
     private var isArScreenResumed: Boolean = false
 
+    private val stopRecordingMutex = Mutex()
+
     init {
         recordingController.onProjectionStopped = {
             viewModelScope.launch {
-                stopRecordingInternal(showSavedMessage = false)
-                emitSideEffect(ArSideEffect.ShowSnackbar("Recording stopped by the system."))
+                stopRecordingInternal(showSavedMessage = false, force = true)
+                emitSideEffect(ArSideEffect.ShowSnackbar(AppError.RecorderStoppedUnexpectedly().message))
             }
         }
     }
@@ -89,28 +90,29 @@ class ArViewModel(
 
     fun onScreenEntered(isCameraPermissionGranted: Boolean) {
         isArRouteActive = true
-        val availabilityError = when (val availability = arAvailabilityChecker.checkAvailability()) {
-            is AppResult.Success -> null
-            is AppResult.Failure -> availability.error
-        }
+        val availability = arAvailabilityChecker.checkAvailability()
+        val availabilityError = arAvailabilityChecker.toBlockingError(availability)
 
         if (isCameraPermissionGranted) {
             _uiState.update {
                 it.copy(
-                    cameraPermissionGranted = true,
-                    blockingError = availabilityError,
+                    hasCameraPermission = true,
+                    arAvailability = availability,
+                    blockingMessage = availabilityError?.message,
                     isArReady = computeArReady(
-                        it,
-                        cameraPermissionGranted = true,
-                        blockingError = availabilityError
+                        state = it,
+                        hasCameraPermission = true,
+                        arAvailability = availability,
+                        blockingMessage = availabilityError?.message
                     )
                 )
             }
         } else {
             _uiState.update {
                 it.copy(
-                    cameraPermissionGranted = false,
-                    blockingError = availabilityError,
+                    hasCameraPermission = false,
+                    arAvailability = availability,
+                    blockingMessage = availabilityError?.message,
                     isArReady = false
                 )
             }
@@ -121,27 +123,39 @@ class ArViewModel(
     }
 
     fun onCameraPermissionResult(granted: Boolean) {
+        if (granted) {
+            onCameraPermissionStateObserved(granted = true)
+            return
+        }
+
         _uiState.update {
+            it.copy(
+                hasCameraPermission = false,
+                blockingMessage = AppError.CameraPermissionDenied().message,
+                isArReady = false
+            )
+        }
+    }
+
+    fun onCameraPermissionStateObserved(granted: Boolean) {
+        _uiState.update { state ->
             if (granted) {
-                val retainedBlockingError = when (it.blockingError) {
-                    is AppError.PermissionDenied -> null
-                    else -> it.blockingError
+                val retainedBlockingMessage = when (state.blockingMessage) {
+                    AppError.CameraPermissionDenied().message -> null
+                    else -> state.blockingMessage
                 }
-                it.copy(
-                    cameraPermissionGranted = true,
-                    blockingError = retainedBlockingError,
+                state.copy(
+                    hasCameraPermission = true,
+                    blockingMessage = retainedBlockingMessage,
                     isArReady = computeArReady(
-                        it,
-                        cameraPermissionGranted = true,
-                        blockingError = retainedBlockingError
+                        state = state,
+                        hasCameraPermission = true,
+                        blockingMessage = retainedBlockingMessage
                     )
                 )
             } else {
-                it.copy(
-                    cameraPermissionGranted = false,
-                    blockingError = AppError.PermissionDenied(
-                        message = "Camera permission is required to use AR."
-                    ),
+                state.copy(
+                    hasCameraPermission = false,
                     isArReady = false
                 )
             }
@@ -150,22 +164,49 @@ class ArViewModel(
 
     fun onSessionCreated(session: Session) {
         currentSession = session
-        _uiState.update { it.copy(isArReady = computeArReady(it)) }
-        syncPlacementPreview()
+        _uiState.update { state ->
+            state.copy(isArReady = computeArReady(state))
+        }
     }
 
     fun onFrameUpdated(frame: Frame, viewportWidthPx: Int, viewportHeightPx: Int) {
-        val hit = arSceneController.computeCenterHit(frame, viewportWidthPx, viewportHeightPx)
-        updateReticleState(hit)
-        syncPlacementPreview()
+        val state = _uiState.value
+        val frameResult = arSceneController.processFrame(
+            frame = frame,
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx,
+            placementMode = state.placementMode
+        )
+        val previewState = if (state.renderAssetState is RenderAssetState.Preparing) {
+            PreviewRenderState.HiddenPreparing
+        } else {
+            frameResult.previewRenderState
+        }
+        val previewErrorReason = (previewState as? PreviewRenderState.Error)?.reason
+        _uiState.update {
+            it.copy(
+                isCameraTracking = frameResult.isCameraTracking,
+                currentHit = frameResult.hitUiModel,
+                previewRenderState = previewState,
+                debugRenderStatus = frameResult.debugRenderStatus,
+                transientMessage = previewErrorReason
+            )
+        }
+        if (previewErrorReason != null && state.transientMessage != previewErrorReason) {
+            viewModelScope.launch {
+                emitSideEffect(ArSideEffect.ShowSnackbar(previewErrorReason))
+            }
+        }
     }
 
     fun onUiEvent(event: ArUiEvent, hasRecordAudioPermission: Boolean) {
+        _uiState.update { it.copy(hasRecordAudioPermission = hasRecordAudioPermission) }
         when (event) {
             ArUiEvent.SelectImageClicked -> onSelectImageClicked()
             ArUiEvent.PlaceClicked -> onPlaceClicked()
-            ArUiEvent.MoveClicked -> onMoveClicked()
-            ArUiEvent.ConfirmMoveClicked -> onConfirmMoveClicked()
+            ArUiEvent.RepositionClicked -> onRepositionClicked()
+            ArUiEvent.ConfirmRepositionClicked -> onConfirmRepositionClicked()
+            ArUiEvent.CancelRepositionClicked -> onCancelRepositionClicked()
             ArUiEvent.DeleteClicked -> onDeleteClicked()
             ArUiEvent.RecordClicked -> onRecordClicked(hasRecordAudioPermission)
             ArUiEvent.StopRecordingClicked -> onStopRecordingClicked()
@@ -175,14 +216,24 @@ class ArViewModel(
 
     fun onArScreenResumed() {
         isArScreenResumed = true
+        arSceneController.resume()
     }
 
     fun onArScreenPaused() {
         isArScreenResumed = false
+        arSceneController.pause()
         if (_uiState.value.recordingState is RecordingState.Active) {
             viewModelScope.launch {
-                stopRecordingInternal(showSavedMessage = false)
+                stopRecordingInternal(showSavedMessage = false, force = true)
                 emitSideEffect(ArSideEffect.ShowSnackbar("Recording stopped because AR screen is no longer active."))
+            }
+        }
+    }
+
+    fun onArScreenStopped() {
+        if (_uiState.value.recordingState is RecordingState.Active) {
+            viewModelScope.launch {
+                stopRecordingInternal(showSavedMessage = false, force = true)
             }
         }
     }
@@ -196,39 +247,71 @@ class ArViewModel(
         }
 
         viewModelScope.launch {
-            when (val result = loadImageUseCase(uri)) {
+            _uiState.update {
+                it.copy(
+                    selectedImage = null,
+                    placedImage = null,
+                    placementMode = PlacementMode.WaitingForPlacement,
+                    renderAssetState = RenderAssetState.Preparing,
+                    previewRenderState = PreviewRenderState.HiddenPreparing,
+                    debugRenderStatus = DebugRenderStatus(),
+                    transientMessage = null
+                )
+            }
+
+            when (val metadataResult = loadImageUseCase(uri)) {
                 is AppResult.Success -> {
-                    when (val prepareResult = arSceneController.prepareSelectedImage(result.value)) {
-                        is AppResult.Failure -> {
-                            handleError(prepareResult.error)
-                            return@launch
+                    val replacement = replaceImageUseCase(metadataResult.value)
+                    when (val prepare = arSceneController.prepareSelectedImage(metadataResult.value)) {
+                        is AppResult.Success -> {
+                            _uiState.update {
+                                it.copy(
+                                    selectedImage = replacement.selectedImage,
+                                    placedImage = replacement.placedImage,
+                                    placementMode = replacement.placementMode,
+                                    renderAssetState = RenderAssetState.Ready(prepare.value),
+                                    previewRenderState = PreviewRenderState.HiddenNoStableHit,
+                                    debugRenderStatus = arSceneController.currentDebugRenderStatus(),
+                                    blockingMessage = null
+                                )
+                            }
                         }
 
-                        is AppResult.Success -> Unit
+                        is AppResult.Failure -> {
+                            _uiState.update {
+                                it.copy(
+                                    selectedImage = null,
+                                    placedImage = null,
+                                    placementMode = PlacementMode.WaitingForPlacement,
+                                    renderAssetState = RenderAssetState.Error(prepare.error.message),
+                                    previewRenderState = PreviewRenderState.Error(prepare.error.message),
+                                    debugRenderStatus = arSceneController.currentDebugRenderStatus()
+                                )
+                            }
+                            emitSideEffect(ArSideEffect.ShowSnackbar(prepare.error.message))
+                        }
                     }
-
-                    val replacement = replaceImageUseCase(result.value)
-                    clearReticleStabilization()
-                    _uiState.update {
-                        it.copy(
-                            selectedImage = replacement.selectedImage,
-                            placedImage = replacement.placedImage,
-                            placementMode = replacement.placementMode,
-                            isImagePrepared = true,
-                            blockingError = null
-                        )
-                    }
-                    syncPlacementPreview()
                 }
 
                 is AppResult.Failure -> {
-                    handleError(result.error)
+                    _uiState.update {
+                        it.copy(
+                            selectedImage = null,
+                            placedImage = null,
+                            placementMode = PlacementMode.WaitingForPlacement,
+                            renderAssetState = RenderAssetState.Error(metadataResult.error.message),
+                            previewRenderState = PreviewRenderState.Error(metadataResult.error.message),
+                            debugRenderStatus = arSceneController.currentDebugRenderStatus()
+                        )
+                    }
+                    emitSideEffect(ArSideEffect.ShowSnackbar(metadataResult.error.message))
                 }
             }
         }
     }
 
     fun onRecordAudioPermissionResult(granted: Boolean) {
+        _uiState.update { it.copy(hasRecordAudioPermission = granted) }
         if (!canStartRecordingFromArScreen()) {
             _uiState.update { it.copy(recordingState = RecordingState.Idle) }
             viewModelScope.launch {
@@ -239,7 +322,6 @@ class ArViewModel(
 
         if (granted) {
             viewModelScope.launch {
-                emitAppWindowRecordingGuidanceIfSupported()
                 emitSideEffect(
                     ArSideEffect.RequestMediaProjectionConsent(recordingController.createConsentIntent())
                 )
@@ -247,9 +329,7 @@ class ArViewModel(
         } else {
             _uiState.update { it.copy(recordingState = RecordingState.Idle) }
             viewModelScope.launch {
-                emitSideEffect(
-                    ArSideEffect.ShowSnackbar("Microphone permission is required to record.")
-                )
+                emitSideEffect(ArSideEffect.ShowSnackbar(AppError.MicrophonePermissionDenied().message))
             }
         }
     }
@@ -266,7 +346,7 @@ class ArViewModel(
         if (resultCode != Activity.RESULT_OK || data == null) {
             _uiState.update { it.copy(recordingState = RecordingState.Idle) }
             viewModelScope.launch {
-                emitSideEffect(ArSideEffect.ShowSnackbar("Screen capture consent was canceled."))
+                emitSideEffect(ArSideEffect.ShowSnackbar(AppError.MediaProjectionDenied().message))
             }
             return
         }
@@ -302,7 +382,7 @@ class ArViewModel(
 
         if (sizeChanged && _uiState.value.recordingState is RecordingState.Active) {
             viewModelScope.launch {
-                stopRecordingInternal(showSavedMessage = false)
+                stopRecordingInternal(showSavedMessage = false, force = true)
                 emitSideEffect(ArSideEffect.ShowSnackbar("Recording stopped due to window size change."))
             }
         }
@@ -315,8 +395,7 @@ class ArViewModel(
             stopRecordingInternal(showSavedMessage = false, force = true)
         }
         currentSession = null
-        clearReticleStabilization()
-        arSceneController.clear()
+        arSceneController.release()
         _uiState.value = ArUiState()
     }
 
@@ -343,9 +422,13 @@ class ArViewModel(
         }
     }
 
+    internal fun setUiStateForTest(state: ArUiState) {
+        _uiState.value = state
+    }
+
     override fun onCleared() {
         super.onCleared()
-        arSceneController.clear()
+        arSceneController.release()
         recordingController.release()
     }
 
@@ -363,43 +446,59 @@ class ArViewModel(
         if (!state.canPlace) {
             return
         }
-        val selectedImage = state.selectedImage ?: return
-        val hit = stabilizedHit ?: return
+        val preparedAsset = (state.renderAssetState as? RenderAssetState.Ready)?.asset ?: return
         val session = currentSession ?: return
 
-        when (val result = arSceneController.placeImage(session, selectedImage, hit)) {
+        when (val result = arSceneController.placePreparedImage(session, preparedAsset)) {
             is AppResult.Success -> {
                 val placedByUseCase = placeImageUseCase.createPlacedState(
                     anchorId = result.value.anchorId,
-                    selectedImage = selectedImage,
+                    preparedAsset = preparedAsset,
                     rotationYDegrees = result.value.transform.rotationYDegrees
                 ).copy(transform = result.value.transform)
 
                 _uiState.update {
                     it.copy(
                         placedImage = placedByUseCase,
-                        placementMode = PlacementMode.Placed
+                        placementMode = PlacementMode.Placed,
+                        previewRenderState = PreviewRenderState.HiddenNoStableHit,
+                        debugRenderStatus = arSceneController.currentDebugRenderStatus()
                     )
                 }
-                syncPlacementPreview()
             }
 
             is AppResult.Failure -> {
-                handleError(result.error)
+                when (result.error) {
+                    is AppError.StaleOrMissingPreparedAssetHandle,
+                    is AppError.MetadataOnlySuccessAttempted,
+                    is AppError.DimensionOnlySuccessAttempted,
+                    is AppError.PreviewIdentityMismatch -> {
+                        _uiState.update {
+                            it.copy(
+                                renderAssetState = RenderAssetState.Error(result.error.message),
+                                previewRenderState = PreviewRenderState.Error(result.error.message)
+                            )
+                        }
+                    }
+
+                    else -> Unit
+                }
+                viewModelScope.launch {
+                    emitSideEffect(ArSideEffect.ShowSnackbar(result.error.message))
+                }
             }
         }
     }
 
-    private fun onMoveClicked() {
+    private fun onRepositionClicked() {
         val newMode = enterRepositionModeUseCase(hasPlacedImage = _uiState.value.placedImage != null)
+        arSceneController.enterRepositionMode()
         _uiState.update { it.copy(placementMode = newMode) }
-        syncPlacementPreview()
     }
 
-    private fun onConfirmMoveClicked() {
-        val hit = stabilizedHit ?: return
+    private fun onConfirmRepositionClicked() {
         val session = currentSession ?: return
-        when (val result = arSceneController.reposition(session, hit)) {
+        when (val result = arSceneController.confirmReposition(session)) {
             is AppResult.Success -> {
                 val newMode = confirmRepositionUseCase(
                     hasPlacedImage = true,
@@ -408,10 +507,10 @@ class ArViewModel(
                 _uiState.update {
                     it.copy(
                         placedImage = result.value,
-                        placementMode = newMode
+                        placementMode = newMode,
+                        debugRenderStatus = arSceneController.currentDebugRenderStatus()
                     )
                 }
-                syncPlacementPreview()
             }
 
             is AppResult.Failure -> {
@@ -422,16 +521,22 @@ class ArViewModel(
         }
     }
 
+    private fun onCancelRepositionClicked() {
+        arSceneController.cancelReposition()
+        _uiState.update { it.copy(placementMode = PlacementMode.Placed) }
+    }
+
     private fun onDeleteClicked() {
         arSceneController.deleteImage()
         val newMode = deleteImageUseCase()
         _uiState.update {
             it.copy(
                 placedImage = null,
-                placementMode = newMode
+                placementMode = newMode,
+                previewRenderState = PreviewRenderState.HiddenNoStableHit,
+                debugRenderStatus = arSceneController.currentDebugRenderStatus()
             )
         }
-        syncPlacementPreview()
         viewModelScope.launch {
             emitSideEffect(ArSideEffect.ShowSnackbar("Image removed"))
         }
@@ -447,13 +552,15 @@ class ArViewModel(
         if (!requestRecordingUseCase(_uiState.value.recordingState)) {
             return
         }
+        if (!_uiState.value.canRecord) {
+            return
+        }
 
         _uiState.update { it.copy(recordingState = RecordingState.Preparing) }
         viewModelScope.launch {
             if (!hasRecordAudioPermission) {
                 emitSideEffect(ArSideEffect.RequestRecordAudioPermission)
             } else {
-                emitAppWindowRecordingGuidanceIfSupported()
                 emitSideEffect(
                     ArSideEffect.RequestMediaProjectionConsent(recordingController.createConsentIntent())
                 )
@@ -472,7 +579,7 @@ class ArViewModel(
             if (_uiState.value.recordingState !is RecordingState.Idle &&
                 _uiState.value.recordingState !is RecordingState.Failed
             ) {
-                stopRecordingInternal(showSavedMessage = false)
+                stopRecordingInternal(showSavedMessage = false, force = true)
             }
             emitSideEffect(ArSideEffect.NavigateBack)
         }
@@ -481,16 +588,16 @@ class ArViewModel(
     private suspend fun stopRecordingInternal(
         showSavedMessage: Boolean,
         force: Boolean = false
-    ) {
+    ) = stopRecordingMutex.withLock {
         val state = _uiState.value.recordingState
         if (!force && state is RecordingState.Idle) {
-            return
+            return@withLock
+        }
+        if (state is RecordingState.Finalizing) {
+            return@withLock
         }
 
-        if (state !is RecordingState.Finalizing) {
-            _uiState.update { it.copy(recordingState = RecordingState.Finalizing) }
-        }
-
+        _uiState.update { it.copy(recordingState = RecordingState.Finalizing) }
         when (val result = stopRecordingUseCase()) {
             is AppResult.Success -> {
                 _uiState.update { it.copy(recordingState = RecordingState.Idle) }
@@ -506,72 +613,26 @@ class ArViewModel(
         }
     }
 
-    private fun handleError(error: AppError) {
-        if (error.blocking) {
-            _uiState.update { it.copy(blockingError = error, isArReady = false) }
-            return
-        }
-
-        viewModelScope.launch {
-            emitSideEffect(ArSideEffect.ShowSnackbar(error.message))
-        }
+    private suspend fun emitSideEffect(effect: ArSideEffect) {
+        _sideEffects.emit(effect)
     }
 
-    private fun updateReticleState(hit: HitTestResult?) {
-        if (hit == null) {
-            clearReticleStabilization()
-            _uiState.update {
-                it.copy(
-                    reticle = ReticleUiState(
-                        hasValidHit = false,
-                        stabilizationFrames = 0,
-                        isStabilized = false
-                    )
-                )
-            }
-            return
-        }
-
-        val sameTrackable = candidateTrackableId == hit.trackableId
-        val samePose = candidatePose?.let { isApproxSamePose(it, hit.hitPose) } ?: false
-
-        stabilizationFrames = if (sameTrackable && samePose) {
-            stabilizationFrames + 1
-        } else {
-            1
-        }
-
-        candidateTrackableId = hit.trackableId
-        candidatePose = hit.hitPose
-
-        val stabilized = stabilizationFrames >= REQUIRED_STABLE_FRAMES
-        stabilizedHit = if (stabilized) hit else null
-
-        _uiState.update {
-            it.copy(
-                reticle = ReticleUiState(
-                    hasValidHit = true,
-                    stabilizationFrames = stabilizationFrames,
-                    isStabilized = stabilized
-                )
-            )
-        }
+    private fun computeArReady(
+        state: ArUiState,
+        hasCameraPermission: Boolean = state.hasCameraPermission,
+        arAvailability: ArAvailability = state.arAvailability,
+        blockingMessage: String? = state.blockingMessage
+    ): Boolean {
+        val availabilityReady = arAvailability == ArAvailability.Supported ||
+            arAvailability == ArAvailability.Checking ||
+            arAvailability == ArAvailability.Unknown
+        return hasCameraPermission &&
+            availabilityReady &&
+            blockingMessage == null &&
+            currentSession != null
     }
 
-    private fun clearReticleStabilization() {
-        candidateTrackableId = null
-        candidatePose = null
-        stabilizationFrames = 0
-        stabilizedHit = null
-    }
-
-    private fun isApproxSamePose(first: Pose, second: Pose): Boolean {
-        val t1 = first.translation
-        val t2 = second.translation
-        return abs(t1[0] - t2[0]) < 0.02f &&
-            abs(t1[1] - t2[1]) < 0.02f &&
-            abs(t1[2] - t2[2]) < 0.02f
-    }
+    private fun canStartRecordingFromArScreen(): Boolean = isArRouteActive && isArScreenResumed
 
     private fun normalizeDegrees(value: Float): Float {
         var normalized = value % 360f
@@ -581,46 +642,7 @@ class ArViewModel(
         return normalized
     }
 
-    private suspend fun emitSideEffect(effect: ArSideEffect) {
-        _sideEffects.emit(effect)
-    }
-
-    private fun syncPlacementPreview() {
-        val state = _uiState.value
-        val shouldPreview = state.placementMode == PlacementMode.WaitingForPlacement &&
-            state.selectedImage != null &&
-            state.isImagePrepared &&
-            state.isArReady
-
-        if (!shouldPreview) {
-            arSceneController.hidePlacementPreview()
-            return
-        }
-
-        arSceneController.updatePlacementPreview(stabilizedHit)
-    }
-
-    private fun computeArReady(
-        state: ArUiState,
-        cameraPermissionGranted: Boolean = state.cameraPermissionGranted,
-        blockingError: AppError? = state.blockingError
-    ): Boolean {
-        return cameraPermissionGranted && blockingError == null && currentSession != null
-    }
-
-    private fun canStartRecordingFromArScreen(): Boolean = isArRouteActive && isArScreenResumed
-
-    private suspend fun emitAppWindowRecordingGuidanceIfSupported() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            emitSideEffect(
-                ArSideEffect.ShowSnackbar("In the next dialog, select this app window to record.")
-            )
-        }
-    }
-
     companion object {
-        private const val REQUIRED_STABLE_FRAMES = 3
-
         fun provideFactory(appContainer: AppContainer): ViewModelProvider.Factory {
             return object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")

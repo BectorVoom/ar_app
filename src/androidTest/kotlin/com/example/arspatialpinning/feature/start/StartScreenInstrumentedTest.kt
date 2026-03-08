@@ -1,8 +1,9 @@
 package com.example.arspatialpinning.feature.start
 
+import androidx.activity.ComponentActivity
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -16,7 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class StartScreenInstrumentedTest {
 
     @get:Rule
-    val composeRule = createComposeRule()
+    val composeRule = createAndroidComposeRule<ComponentActivity>()
 
     @Test
     fun startButton_invokesNavigationCallback() {
@@ -31,8 +32,8 @@ class StartScreenInstrumentedTest {
         }
 
         composeRule.onNodeWithText("AR Spatial Pinning").assertIsDisplayed()
-        composeRule.onNodeWithText("Start AR").assertIsDisplayed()
-        composeRule.onNodeWithText("Start AR").performClick()
+        composeRule.onNodeWithText("Start AR Session").assertIsDisplayed()
+        composeRule.onNodeWithText("Start AR Session").performClick()
 
         composeRule.runOnIdle {
             assertTrue(clicked.get())

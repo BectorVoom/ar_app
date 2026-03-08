@@ -50,19 +50,19 @@ fun ArControls(
                 }
             } else if (uiState.placementMode == PlacementMode.Repositioning) {
                 Button(
-                    enabled = uiState.canConfirmMove,
-                    onClick = { onEvent(ArUiEvent.ConfirmMoveClicked) },
+                    enabled = uiState.canConfirmReposition,
+                    onClick = { onEvent(ArUiEvent.ConfirmRepositionClicked) },
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(text = "Confirm Move")
+                    Text(text = "Confirm Reposition")
                 }
             } else {
                 Button(
-                    enabled = uiState.canMove,
-                    onClick = { onEvent(ArUiEvent.MoveClicked) },
+                    enabled = uiState.canReposition,
+                    onClick = { onEvent(ArUiEvent.RepositionClicked) },
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(text = "Move")
+                    Text(text = "Reposition")
                 }
             }
         }
@@ -88,6 +88,7 @@ fun ArControls(
                 uiState.recordingState is RecordingState.Finalizing
 
             Button(
+                enabled = uiState.canRecord || isRecording,
                 onClick = {
                     if (isRecording) {
                         onEvent(ArUiEvent.StopRecordingClicked)
@@ -98,6 +99,21 @@ fun ArControls(
                 modifier = Modifier.weight(1f)
             ) {
                 Text(text = if (isRecording) "Stop Recording" else "Record")
+            }
+        }
+
+        if (uiState.placementMode == PlacementMode.Repositioning) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    enabled = uiState.canCancelReposition,
+                    onClick = { onEvent(ArUiEvent.CancelRepositionClicked) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(text = "Cancel Reposition")
+                }
             }
         }
     }

@@ -3,60 +3,129 @@ package com.example.arspatialpinning.platform.file
 import android.content.ContentResolver
 import android.net.Uri
 import android.provider.OpenableColumns
-import com.example.arspatialpinning.common.AppResult
+import android.util.Log
 import com.example.arspatialpinning.common.AppError
+import com.example.arspatialpinning.common.AppResult
+import com.example.arspatialpinning.domain.model.ImageFormat
+
+data class ImageValidationResult(
+    val format: ImageFormat,
+    val mimeType: String,
+    val displayName: String?
+)
 
 class ImageValidator(
-    private val contentResolver: ContentResolver
+    private val contentResolver: ContentResolver,
+    private val uriStreamOpener: UriStreamOpener = ContentResolverUriStreamOpener(contentResolver)
 ) {
-    fun validate(uri: Uri): AppResult<Unit> {
-        val mimeType: String?
-        val displayName: String?
-        val read: Int
-        val header = ByteArray(MAX_HEADER_LENGTH)
+    fun validate(uri: Uri): AppResult<ImageValidationResult> {
+        val mimeType = runCatching { contentResolver.getType(uri) }.getOrNull()
+        val displayName = readDisplayName(uri)
+        val inspection: HeaderInspection
 
         try {
-            mimeType = contentResolver.getType(uri)
-            displayName = readDisplayName(uri)
-            read = contentResolver.openInputStream(uri)?.use { input ->
-                input.read(header, 0, header.size)
-            } ?: -1
-        } catch (_: Throwable) {
-            return AppResult.Failure(AppError.InvalidImage("Unable to read selected image."))
+            val stream = uriStreamOpener.openForRead(uri)
+            if (stream == null) {
+                Log.e(TAG, "Unable to inspect selected image because stream open returned null. uri=$uri mime=$mimeType displayName=$displayName")
+                return AppResult.Failure(AppError.FileOpenFailed())
+            }
+            inspection = stream.use(::inspectHeaderAndTail)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to inspect selected image uri=$uri", error)
+            return AppResult.Failure(AppError.FileOpenFailed())
         }
 
-        if (!ImageValidationRules.isSupportedImage(mimeType, displayName, header, read)) {
-            return AppResult.Failure(
-                AppError.InvalidImage("Please select a valid PNG or JPEG image.")
+        val format = ImageValidationRules.resolveFormat(
+            mimeType = mimeType,
+            displayName = displayName,
+            header = inspection.header,
+            headerLength = inspection.headerLength,
+            hasJpegEndOfImage = inspection.hasJpegEndOfImage
+        ) ?: return AppResult.Failure(AppError.InvalidImage())
+
+        val canonicalMimeType = when (format) {
+            ImageFormat.Png -> "image/png"
+            ImageFormat.Jpeg -> "image/jpeg"
+        }
+        return AppResult.Success(
+            ImageValidationResult(
+                format = format,
+                mimeType = canonicalMimeType,
+                displayName = displayName
             )
+        )
+    }
+
+    private fun inspectHeaderAndTail(input: java.io.InputStream): HeaderInspection {
+        val header = ByteArray(MAX_HEADER_LENGTH)
+        var headerLength = 0
+        var totalBytes = 0L
+        var penultimate = -1
+        var last = -1
+        val buffer = ByteArray(8192)
+
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) {
+                break
+            }
+            for (index in 0 until read) {
+                val value = buffer[index].toInt() and 0xFF
+                if (headerLength < header.size) {
+                    header[headerLength] = value.toByte()
+                    headerLength += 1
+                }
+                penultimate = last
+                last = value
+                totalBytes += 1
+            }
         }
 
-        return AppResult.Success(Unit)
+        val hasJpegEndOfImage = totalBytes >= 2 &&
+            penultimate == JPEG_EOI_FIRST &&
+            last == JPEG_EOI_SECOND
+
+        return HeaderInspection(
+            header = header,
+            headerLength = headerLength,
+            hasJpegEndOfImage = hasJpegEndOfImage
+        )
     }
 
     private fun readDisplayName(uri: Uri): String? {
-        val fromMetadata = contentResolver.query(
-            uri,
-            arrayOf(OpenableColumns.DISPLAY_NAME),
-            null,
-            null,
-            null
-        )?.use { cursor ->
-            if (!cursor.moveToFirst()) {
-                return@use null
-            }
-            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (index == -1) {
+        val fromMetadata = runCatching {
+            contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
                 null
-            } else {
-                cursor.getString(index)
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) {
+                    return@use null
+                }
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index == -1) {
+                    null
+                } else {
+                    cursor.getString(index)
+                }
             }
-        }
+        }.getOrNull()
         return fromMetadata ?: uri.lastPathSegment
     }
 
+    private data class HeaderInspection(
+        val header: ByteArray,
+        val headerLength: Int,
+        val hasJpegEndOfImage: Boolean
+    )
+
     private companion object {
-        const val MAX_HEADER_LENGTH = 8
+        const val TAG = "ImageValidator"
+        const val MAX_HEADER_LENGTH = 16
+        const val JPEG_EOI_FIRST = 0xFF
+        const val JPEG_EOI_SECOND = 0xD9
     }
 }
 
@@ -81,18 +150,15 @@ internal object ImageValidationRules {
         0xFF.toByte()
     )
 
-    fun isSupportedImage(
+    fun resolveFormat(
         mimeType: String?,
         displayName: String?,
         header: ByteArray,
-        headerLength: Int
-    ): Boolean {
+        headerLength: Int,
+        hasJpegEndOfImage: Boolean
+    ): ImageFormat? {
         if (headerLength <= 0) {
-            return false
-        }
-
-        if (mimeType != null && mimeType !in ALLOWED_MIME_TYPES) {
-            return false
+            return null
         }
 
         val extension = displayName
@@ -100,41 +166,51 @@ internal object ImageValidationRules {
             ?.lowercase()
             ?.takeIf { it.isNotBlank() }
         if (extension != null && extension !in ALLOWED_EXTENSIONS) {
-            return false
+            return null
         }
 
-        val signatureType = detectSignatureType(header, headerLength) ?: return false
-        if (mimeType != null) {
-            return when (mimeType) {
-                MIME_PNG -> signatureType == SignatureType.Png
-                MIME_JPEG -> signatureType == SignatureType.Jpeg
-                else -> false
+        val signatureFormat = detectBySignature(header, headerLength) ?: return null
+        if (signatureFormat == ImageFormat.Jpeg && !hasJpegEndOfImage) {
+            return null
+        }
+
+        if (mimeType != null && mimeType in ALLOWED_MIME_TYPES) {
+            val expectedFromMime = when (mimeType) {
+                MIME_PNG -> ImageFormat.Png
+                MIME_JPEG -> ImageFormat.Jpeg
+                else -> null
+            } ?: return null
+            if (expectedFromMime != signatureFormat) {
+                return null
             }
         }
 
-        return extension == null || when (extension) {
-            "png" -> signatureType == SignatureType.Png
-            "jpg", "jpeg" -> signatureType == SignatureType.Jpeg
-            else -> false
+        // MIME can be inconsistent across document providers; fall back to extension+header.
+        if (extension != null) {
+            val expectedFromExtension = when (extension) {
+                "png" -> ImageFormat.Png
+                "jpg", "jpeg" -> ImageFormat.Jpeg
+                else -> null
+            } ?: return null
+            if (expectedFromExtension != signatureFormat) {
+                return null
+            }
         }
+
+        return signatureFormat
     }
 
-    private fun detectSignatureType(header: ByteArray, headerLength: Int): SignatureType? {
+    private fun detectBySignature(header: ByteArray, headerLength: Int): ImageFormat? {
         if (headerLength >= PNG_SIGNATURE.size &&
             header.copyOfRange(0, PNG_SIGNATURE.size).contentEquals(PNG_SIGNATURE)
         ) {
-            return SignatureType.Png
+            return ImageFormat.Png
         }
         if (headerLength >= JPEG_SIGNATURE.size &&
             header.copyOfRange(0, JPEG_SIGNATURE.size).contentEquals(JPEG_SIGNATURE)
         ) {
-            return SignatureType.Jpeg
+            return ImageFormat.Jpeg
         }
         return null
-    }
-
-    private enum class SignatureType {
-        Png,
-        Jpeg
     }
 }

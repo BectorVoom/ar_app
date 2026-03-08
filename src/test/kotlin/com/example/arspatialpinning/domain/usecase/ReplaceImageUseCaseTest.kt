@@ -1,7 +1,7 @@
 package com.example.arspatialpinning.domain.usecase
 
-import android.graphics.Bitmap
 import android.net.Uri
+import com.example.arspatialpinning.domain.model.ImageFormat
 import com.example.arspatialpinning.domain.model.PlacementMode
 import com.example.arspatialpinning.domain.model.SelectedImage
 import org.junit.Assert.assertEquals
@@ -19,10 +19,14 @@ class ReplaceImageUseCaseTest {
 
     @Test
     fun `replace resets placed image and returns waiting mode`() {
-        val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
         val selected = SelectedImage(
             uri = Uri.parse("content://test/new.png"),
-            bitmap = bitmap
+            displayName = "new.png",
+            mimeType = "image/png",
+            widthPx = 100,
+            heightPx = 100,
+            format = ImageFormat.Png,
+            selectionRevision = 42L
         )
 
         val result = useCase(selected)

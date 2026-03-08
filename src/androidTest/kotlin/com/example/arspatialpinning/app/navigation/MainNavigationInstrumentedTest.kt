@@ -1,9 +1,10 @@
 package com.example.arspatialpinning.app.navigation
 
 import android.content.Context
+import androidx.activity.ComponentActivity
 import androidx.compose.material3.Text
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.core.app.ApplicationProvider
@@ -17,7 +18,7 @@ import org.junit.runner.RunWith
 class MainNavigationInstrumentedTest {
 
     @get:Rule
-    val composeRule = createComposeRule()
+    val composeRule = createAndroidComposeRule<ComponentActivity>()
 
     @Test
     fun startRoute_navigatesToArRoute() {
@@ -33,7 +34,7 @@ class MainNavigationInstrumentedTest {
         }
 
         composeRule.onNodeWithText("AR Spatial Pinning").assertIsDisplayed()
-        composeRule.onNodeWithText("Start AR").performClick()
+        composeRule.onNodeWithText("Start AR Session").performClick()
 
         composeRule.onNodeWithText("AR Route Stub").assertIsDisplayed()
     }

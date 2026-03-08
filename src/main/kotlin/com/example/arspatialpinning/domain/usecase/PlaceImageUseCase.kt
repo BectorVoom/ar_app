@@ -2,7 +2,7 @@ package com.example.arspatialpinning.domain.usecase
 
 import com.example.arspatialpinning.domain.model.PlacedImageState
 import com.example.arspatialpinning.domain.model.PlacementTransform
-import com.example.arspatialpinning.domain.model.SelectedImage
+import com.example.arspatialpinning.domain.model.PreparedRenderAsset
 import kotlin.math.pow
 import kotlin.math.round
 
@@ -10,11 +10,11 @@ class PlaceImageUseCase {
 
     fun createPlacedState(
         anchorId: String,
-        selectedImage: SelectedImage,
+        preparedAsset: PreparedRenderAsset,
         rotationYDegrees: Float = 0f
     ): PlacedImageState {
         val heightMeters = DEFAULT_HEIGHT_METERS
-        val widthMeters = (heightMeters * selectedImage.aspectRatio).roundTo(4)
+        val widthMeters = (heightMeters * preparedAsset.aspectRatio).roundTo(4)
         return PlacedImageState(
             anchorId = anchorId,
             widthMeters = widthMeters,

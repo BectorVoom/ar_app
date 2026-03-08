@@ -14,6 +14,8 @@ import com.example.arspatialpinning.platform.ar.ArAvailabilityChecker
 import com.example.arspatialpinning.platform.ar.ArSceneController
 import com.example.arspatialpinning.platform.ar.ArSceneControllerImpl
 import com.example.arspatialpinning.platform.file.AndroidImageUriReader
+import com.example.arspatialpinning.platform.file.ContentResolverUriReadPermissionGuard
+import com.example.arspatialpinning.platform.file.ContentResolverUriStreamOpener
 import com.example.arspatialpinning.platform.file.ImageValidator
 import com.example.arspatialpinning.platform.media.RecordingController
 import com.example.arspatialpinning.platform.media.RecordingControllerImpl
@@ -26,13 +28,22 @@ class AppContainer(
     val logger = AndroidLogger()
     val dispatchers = DefaultDispatcherProvider
 
-    private val imageUriReader = AndroidImageUriReader(appContext.contentResolver)
-    private val imageValidator = ImageValidator(appContext.contentResolver)
+    private val uriStreamOpener = ContentResolverUriStreamOpener(appContext.contentResolver)
+    private val uriReadPermissionGuard = ContentResolverUriReadPermissionGuard(appContext.contentResolver)
+    private val imageUriReader = AndroidImageUriReader(
+        contentResolver = appContext.contentResolver,
+        uriStreamOpener = uriStreamOpener
+    )
+    private val imageValidator = ImageValidator(
+        contentResolver = appContext.contentResolver,
+        uriStreamOpener = uriStreamOpener
+    )
 
     val loadImageUseCase = LoadImageUseCase(
         imageUriReader = imageUriReader,
         imageValidator = imageValidator,
-        dispatchers = dispatchers
+        dispatchers = dispatchers,
+        uriReadPermissionGuard = uriReadPermissionGuard
     )
     val placeImageUseCase = PlaceImageUseCase()
     val replaceImageUseCase = ReplaceImageUseCase()
@@ -44,7 +55,9 @@ class AppContainer(
 
     fun createArSceneController(): ArSceneController = ArSceneControllerImpl(
         context = appContext,
-        logger = logger
+        logger = logger,
+        imageUriReader = imageUriReader,
+        uriReadPermissionGuard = uriReadPermissionGuard
     )
 
     fun createRecordingController(): RecordingController {
